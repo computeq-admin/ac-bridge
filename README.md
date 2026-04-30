@@ -28,7 +28,7 @@ cd aat-bridge
 Das Setup-Skript führt dich durch folgende Schritte:
 
 1. **Token-A generieren** — eindeutige ID deiner Bridge-Installation
-2. **Token-A im Webportal eintragen** → https://ai-agent-tasks.computeq.de/account.php
+2. **Token-A im Webportal eintragen** → https://agent-connect.computeq.de/
 3. **OTT (One-Time-Token) eingeben** — vom Portal zurückgegeben
 4. **Agent-Endpunkt konfigurieren** — URL + API-Token deines KI-Agenten
 5. **MQTT konfigurieren** — Verbindungsdaten vom Portal
