@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-AAT Bridge — AI Agent Tasks
+AC Bridge — AI Agent Tasks
 Verbindet Alexa (via MQTT Wakeup) mit dem lokalen KI-Agenten (OpenWebUI / OpenAI-compatible)
 
 Ablauf:
   1. Bridge startet, liest config.json
-  2. Subscribed auf MQTT Topic: aat/{token_a}
+  2. Subscribed auf MQTT Topic: ac/{token_a}
   3. Bei Wakeup-Message: holt Job von Server (Token-B)
   4. Übergibt Prompt an den KI-Agenten
   5. Schreibt Antwort zurück an Server (Token-B rotiert)
@@ -36,10 +36,10 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('aat_bridge.log'),
+        logging.FileHandler('ac_bridge.log'),
     ]
 )
-log = logging.getLogger('aat_bridge')
+log = logging.getLogger('ac_bridge')
 
 # ─────────────────────────────────────────────
 # Config
@@ -305,7 +305,7 @@ def process_wakeup(cfg):
 def on_connect(client, userdata, flags, rc):
     cfg = userdata
     if rc == 0:
-        topic = f"aat/{cfg['token_a']}"
+        topic = f"ac/{cfg['token_a']}"
         client.subscribe(topic, qos=1)
         log.info(f'Connected to MQTT broker, subscribed to: {topic}')
     else:
@@ -352,7 +352,7 @@ def main():
         sys.exit(1)
 
     client = mqtt.Client(
-        client_id=f"aat-bridge-{cfg['token_a'][:8]}",
+        client_id=f"ac-bridge-{cfg['token_a'][:8]}",
         userdata=cfg,
     )
     client.username_pw_set(cfg['mqtt_user'], cfg['mqtt_password'])
@@ -372,8 +372,8 @@ def main():
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    log.info(f"AAT Bridge starting — server: {cfg['server_url']}")
-    log.info(f"MQTT: {cfg['mqtt_host']}:{cfg['mqtt_port']}, topic: aat/{cfg['token_a']}")
+    log.info(f"AC Bridge starting — server: {cfg['server_url']}")
+    log.info(f"MQTT: {cfg['mqtt_host']}:{cfg['mqtt_port']}, topic: ac/{cfg['token_a']}")
 
     while True:
         try:

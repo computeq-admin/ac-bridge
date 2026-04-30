@@ -14,7 +14,7 @@ Verbindet deinen lokalen KI-Agenten mit dem Alexa Skill "Agent Connect" und der 
 ```bash
 # 1. Repository klonen
 git clone https://github.com/computeq-admin/ac-bridge.git
-cd aat-bridge
+cd ac-bridge
 
 # 2. Installation (erstellt venv, installiert Dependencies)
 ./install.sh
@@ -42,15 +42,15 @@ Am Ende wird `config.json` gespeichert (Berechtigungen: 600).
 ./start.sh
 
 # Als Systemd Service
-sudo cp aat_bridge.service /etc/systemd/system/
+sudo cp ac_bridge.service /etc/systemd/system/
 # YOUR_USER in der Service-Datei anpassen!
-sudo nano /etc/systemd/system/aat_bridge.service
-sudo systemctl enable --now aat_bridge
+sudo nano /etc/systemd/system/ac_bridge.service
+sudo systemctl enable --now ac_bridge
 
 # Logs
-journalctl -u aat_bridge -f
+journalctl -u ac_bridge -f
 # oder
-tail -f aat_bridge.log
+tail -f ac_bridge.log
 ```
 
 ## Konfiguration (config.json)
@@ -61,7 +61,7 @@ Wird von setup.py automatisch erstellt. Felder:
 |------------------|---------------------------------------------------|
 | `token_a`        | Bridge-Identifikation (nicht ändern!)             |
 | `token_b`        | Rotierender API-Token (wird automatisch erneuert) |
-| `server_url`     | URL des AAT-Servers                               |
+| `server_url`     | URL des AC-Servers                               |
 | `agent_endpoint` | OpenAI-kompatibler Endpunkt deines Agenten        |
 | `agent_token`    | API-Token für den Agenten                         |
 | `agent_model`    | Modell-Name (z.B. `chatcompletion`)               |
@@ -75,7 +75,7 @@ Wird von setup.py automatisch erstellt. Felder:
 ## Ablauf
 
 ```
-Alexa → AAT Server → MQTT Wakeup → Bridge
+Alexa → AC Server → MQTT Wakeup → Bridge
                                       ↓
                               Job von Server holen
                                       ↓

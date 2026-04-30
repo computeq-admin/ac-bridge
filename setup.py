@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AAT Bridge Setup
+AC Bridge Setup
 Führt die Ersteinrichtung der Bridge durch:
   1. Token-A generieren
   2. Token-A anzeigen → User trägt es im Webportal ein
@@ -25,7 +25,7 @@ from pathlib import Path
 import requests
 
 CONFIG_FILE = Path(__file__).parent / 'config.json'
-DEFAULT_SERVER = 'https://ai-agent-tasks.computeq.de'
+DEFAULT_SERVER = 'https://agent-connect.computeq.de'
 
 
 def generate_token_a():
@@ -46,10 +46,10 @@ def save_config(cfg):
 
 
 def install_service(install_dir):
-    """Installiert aat_bridge als systemd User-Service"""
-    service_template = Path(__file__).parent / 'aat_bridge.service'
+    """Installiert ac_bridge als systemd User-Service"""
+    service_template = Path(__file__).parent / 'ac_bridge.service'
     if not service_template.exists():
-        print("  ⚠ aat_bridge.service nicht gefunden, übersprungen.")
+        print("  ⚠ ac_bridge.service nicht gefunden, übersprungen.")
         return
 
     content = service_template.read_text()
@@ -58,21 +58,21 @@ def install_service(install_dir):
     systemd_dir = Path.home() / '.config' / 'systemd' / 'user'
     systemd_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = systemd_dir / 'aat_bridge.service'
+    dest = systemd_dir / 'ac_bridge.service'
     dest.write_text(content)
     print(f"  ✓ Service-Datei geschrieben: {dest}")
 
     try:
         subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
-        subprocess.run(['systemctl', '--user', 'enable', '--now', 'aat_bridge'], check=True)
+        subprocess.run(['systemctl', '--user', 'enable', '--now', 'ac_bridge'], check=True)
         print("  ✓ Service aktiviert und gestartet")
     except subprocess.CalledProcessError as e:
         print(f"  ⚠ systemctl Fehler: {e}")
-        print("  Manuell: systemctl --user enable --now aat_bridge")
+        print("  Manuell: systemctl --user enable --now ac_bridge")
     except FileNotFoundError:
         print("  ⚠ systemctl nicht gefunden. Service manuell installieren:")
         print(f"  cp {dest} ~/.config/systemd/user/")
-        print("  systemctl --user enable --now aat_bridge")
+        print("  systemctl --user enable --now ac_bridge")
 
 
 def configure_cli(cfg):
@@ -163,7 +163,7 @@ def main():
             sys.exit(1)
         print()
         print("=" * 60)
-        print("  AAT Bridge — Agent-Konfiguration")
+        print("  AC Bridge — Agent-Konfiguration")
         print("=" * 60)
         cfg = configure_cli(cfg)
         save_config(cfg)
@@ -171,14 +171,14 @@ def main():
         print("  ✓ config.json aktualisiert.")
         print()
         print("  Bridge neu starten um Änderungen zu übernehmen:")
-        print("  systemctl --user restart aat_bridge")
+        print("  systemctl --user restart ac_bridge")
         print("  oder: ./start.sh")
         print()
         sys.exit(0)
 
     print()
     print("=" * 60)
-    print("  AAT Bridge Setup — AI Agent Tasks")
+    print("  AC Bridge Setup — Agent Connect")
     print("=" * 60)
     print()
 
@@ -296,7 +296,7 @@ def main():
         print(f"  python3 -c \"")
         print(f"    from pathlib import Path; import setup")
         print(f"    setup.install_service(Path('{install_dir}'))\"")
-        print("  oder: systemctl --user enable --now aat_bridge")
+        print("  oder: systemctl --user enable --now ac_bridge")
 
     print()
     print("=" * 60)
@@ -307,9 +307,9 @@ def main():
     print("  ./start.sh")
     print()
     print("  Service-Befehle:")
-    print("  systemctl --user status aat_bridge")
-    print("  systemctl --user restart aat_bridge")
-    print("  journalctl --user -u aat_bridge -f")
+    print("  systemctl --user status ac_bridge")
+    print("  systemctl --user restart ac_bridge")
+    print("  journalctl --user -u ac_bridge -f")
     print()
 
 

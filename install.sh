@@ -1,12 +1,12 @@
 #!/bin/bash
 # ─────────────────────────────────────────────
-# AAT Bridge — Installation
+# AC Bridge — Installation
 # ─────────────────────────────────────────────
 set -e
 
 echo ""
 echo "========================================"
-echo "  AAT Bridge — AI Agent Tasks"
+echo "  AC Bridge — AI Agent Tasks"
 echo "  Installation"
 echo "========================================"
 echo ""
