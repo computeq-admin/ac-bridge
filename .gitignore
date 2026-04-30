@@ -1,0 +1,6 @@
+gitupdate.sh
+config.json
+venv/
+ac_bridge.log
+__pycache__/
+*.pyc
