@@ -67,15 +67,43 @@ def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
 
-def apply_config_update(cfg, new_params):
-    """Aktualisiert veränderliche Config-Felder; schützt feste MQTT/Auth-Parameter.
+def apply_config_update(cfg):
+    """Holt ausstehende Config-Aktualisierung vom Server und wendet sie lokal an.
 
-    Wird via MQTT action=update-config ausgelöst. Wenn neue_params ein cli_command
-    enthält, muss dessen Basename in ALLOWED_CLI_EXECUTABLES stehen, sonst wird
-    das gesamte Update abgelehnt.
+    Wird via MQTT action=update-config ausgelöst. Der Server liefert die neuen
+    Werte; protected keys werden auch bei Serverantwort nie überschrieben.
     """
-    if 'cli_command' in new_params:
-        executable = Path(new_params['cli_command']).name
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/get_config_update.php',
+            json={'token_b': cfg['token_b']},
+            timeout=10,
+        )
+        data = r.json()
+    except Exception as e:
+        log.error(f'get_config_update failed: {e}')
+        return False
+
+    if 'token_b_new' in data:
+        cfg['token_b'] = data['token_b_new']
+        save_config(cfg)
+
+    if r.status_code == 401:
+        log.error('Token-B rejected by server during config update.')
+        return False
+
+    if data.get('status') == 'no_update':
+        log.info('update-config: no pending update on server.')
+        return True
+
+    if data.get('status') != 'ok':
+        log.warning(f'update-config: unexpected server response: {data}')
+        return False
+
+    # cli_command Executable gegen Whitelist prüfen
+    cli_command = data.get('cli_command', '')
+    if cli_command:
+        executable = Path(cli_command).name
         if executable not in ALLOWED_CLI_EXECUTABLES:
             log.error(
                 f'update-config rejected: cli_command executable "{executable}" '
@@ -84,18 +112,14 @@ def apply_config_update(cfg, new_params):
             return False
 
     updated_keys = []
-    skipped_keys = []
-    for key, value in new_params.items():
-        if key == 'action':
+    for key, value in data.items():
+        if key in ('status', 'token_b_new'):
             continue
         if key in PROTECTED_CONFIG_KEYS:
-            skipped_keys.append(key)
+            log.warning(f'update-config: server sent protected key "{key}", ignored')
         else:
             cfg[key] = value
             updated_keys.append(key)
-
-    if skipped_keys:
-        log.warning(f'update-config: protected keys ignored: {skipped_keys}')
 
     if updated_keys:
         save_config(cfg)
@@ -378,7 +402,7 @@ def on_message(client, userdata, msg):
     elif action == 'ping':
         send_pong(cfg)
     elif action == 'update-config':
-        apply_config_update(cfg, payload)
+        apply_config_update(cfg)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
