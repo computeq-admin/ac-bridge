@@ -263,6 +263,10 @@ def call_agent_cli(cfg, prompt, system_prompt=''):
       - _current_session_id gesetzt → --resume <id> wird übergeben
       - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert)
     """
+    if not cfg.get('cli_command'):
+        log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
+        return None
+
     cmd = [cfg['cli_command']]
 
     # Session fortsetzen wenn ID vorhanden (vom letzten erfolgreichen Call)
@@ -431,7 +435,7 @@ def on_disconnect(client, userdata, rc):
 def main():
     cfg = load_config()
 
-    required = ['token_a', 'token_b', 'server_url', 'cli_command',
+    required = ['token_a', 'token_b', 'server_url',
                 'mqtt_host', 'mqtt_port', 'mqtt_user', 'mqtt_password']
     missing = [k for k in required if not cfg.get(k)]
     if missing:

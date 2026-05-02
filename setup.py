@@ -44,8 +44,13 @@ def save_config(cfg):
     os.chmod(CONFIG_FILE, 0o600)
 
 
-def install_service(install_dir):
-    """Installiert ac_bridge als systemd User-Service"""
+def sanitize_service_name(email):
+    """Erzeugt einen systemd-kompatiblen Service-Namen aus einer E-Mail-Adresse."""
+    return 'ac_bridge-' + email.replace('@', '-')
+
+
+def install_service(install_dir, service_name):
+    """Installiert ac_bridge als systemd User-Service mit gegebenem Service-Namen."""
     service_template = Path(__file__).parent / 'ac_bridge.service'
     if not service_template.exists():
         print("  ⚠ ac_bridge.service nicht gefunden, übersprungen.")
@@ -57,21 +62,21 @@ def install_service(install_dir):
     systemd_dir = Path.home() / '.config' / 'systemd' / 'user'
     systemd_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = systemd_dir / 'ac_bridge.service'
+    dest = systemd_dir / f'{service_name}.service'
     dest.write_text(content)
     print(f"  ✓ Service-Datei geschrieben: {dest}")
 
     try:
         subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
-        subprocess.run(['systemctl', '--user', 'enable', '--now', 'ac_bridge'], check=True)
-        print("  ✓ Service aktiviert und gestartet")
+        subprocess.run(['systemctl', '--user', 'enable', '--now', service_name], check=True)
+        print(f"  ✓ Service '{service_name}' aktiviert und gestartet")
     except subprocess.CalledProcessError as e:
         print(f"  ⚠ systemctl Fehler: {e}")
-        print("  Manuell: systemctl --user enable --now ac_bridge")
+        print(f"  Manuell: systemctl --user enable --now {service_name}")
     except FileNotFoundError:
         print("  ⚠ systemctl nicht gefunden. Service manuell installieren:")
         print(f"  cp {dest} ~/.config/systemd/user/")
-        print("  systemctl --user enable --now ac_bridge")
+        print(f"  systemctl --user enable --now {service_name}")
 
 
 def configure_cli(cfg):
@@ -172,8 +177,9 @@ def main():
         print()
         print("  ✓ config.json aktualisiert.")
         print()
+        svc = cfg.get('service_name', 'ac_bridge')
         print("  Bridge neu starten um Änderungen zu übernehmen:")
-        print("  systemctl --user restart ac_bridge")
+        print(f"  systemctl --user restart {svc}")
         print("  oder: ./start.sh")
         print()
         sys.exit(0)
@@ -253,7 +259,7 @@ def main():
             print("  Token-A nicht gefunden. Bitte Token-A im Portal eintragen.")
         sys.exit(1)
 
-    # MQTT-Daten + Token-B vom Server übernehmen
+    # MQTT-Daten + Token-B + User-Email vom Server übernehmen
     cfg['token_b']       = data['token_b']
     cfg['mqtt_host']     = data['mqtt_host']
     cfg['mqtt_port']     = data['mqtt_port']
@@ -262,32 +268,48 @@ def main():
     cfg['mqtt_tls']      = data.get('mqtt_tls', False)
     cfg['server_url']    = data.get('server_url', DEFAULT_SERVER)
 
-    print("  ✓ Token-B erhalten")
-    print("  ✓ MQTT-Zugangsdaten erhalten")
+    user_email           = data.get('user_email', '')
+    service_name         = sanitize_service_name(user_email) if user_email else 'ac_bridge'
+    cfg['service_name']  = service_name
 
-    # ── Agent konfigurieren ───────────────────
-    print()
-    print("=" * 60)
-    print("  SCHRITT 3: KI-Agent konfigurieren")
-    print("=" * 60)
-    cfg = configure_cli(cfg)
+    print(f"  ✓ Token-B erhalten")
+    print(f"  ✓ MQTT-Zugangsdaten erhalten")
+    if user_email:
+        print(f"  ✓ User: {user_email}")
+    print(f"  ✓ Service-Name: {service_name}")
+
+    # Minimale CLI-Defaults — werden später per Web-Backend konfiguriert
+    cfg.setdefault('cli_command',                '')
+    cfg.setdefault('cli_working_dir',            '')
+    cfg.setdefault('cli_prompt_param',           '-p')
+    cfg.setdefault('cli_system_prompt_param',    '--system-prompt')
+    cfg.setdefault('cli_session_id_param',       '')
+    cfg.setdefault('cli_session_id_output_field','')
+    cfg.setdefault('cli_answer_output_field',    'result')
+    cfg.setdefault('cli_timeout',                600)
+    cfg.setdefault('cli_extra_params',           '')
+    cfg.setdefault('cli_env',                    {})
     cfg['lang'] = 'DE'
 
     # ── Speichern ─────────────────────────────
     save_config(cfg)
     print("  ✓ config.json gespeichert (Berechtigungen: 600).")
+    print()
+    print("  Hinweis: CLI-Konfiguration (Agent, Parameter) bitte")
+    print("  im Web-Backend unter 'Bridge konfigurieren' vornehmen.")
 
     # ── Service installieren ───────────────────
     print()
     print("=" * 60)
-    print("  SCHRITT 4: Systemd User-Service")
+    print("  SCHRITT 3: Systemd User-Service")
     print("=" * 60)
     print()
     print("  Der Bridge-Service läuft als dein Benutzer (kein sudo nötig).")
+    print(f"  Service-Name: {service_name}")
     print()
     ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
     if ans != 'n':
-        install_service(Path(__file__).parent)
+        install_service(Path(__file__).parent, service_name)
         print()
         print("  Tipp: Damit der Service auch ohne Login startet:")
         print("  loginctl enable-linger $USER")
@@ -295,10 +317,7 @@ def main():
         install_dir = Path(__file__).parent
         print()
         print("  Manuell einrichten:")
-        print(f"  python3 -c \"")
-        print(f"    from pathlib import Path; import setup")
-        print(f"    setup.install_service(Path('{install_dir}'))\"")
-        print("  oder: systemctl --user enable --now ac_bridge")
+        print(f"  systemctl --user enable --now {service_name}")
 
     print()
     print("=" * 60)
