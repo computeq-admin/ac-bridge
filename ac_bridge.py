@@ -50,6 +50,7 @@ CONFIG_FILE = Path(__file__).parent / 'config.json'
 PROTECTED_CONFIG_KEYS = {
     'token_a', 'mqtt_host', 'mqtt_port', 'mqtt_user',
     'mqtt_password', 'mqtt_tls', 'server_url', 'token_b',
+    'service_name',
 }
 
 ALLOWED_CLI_EXECUTABLES = {
@@ -126,6 +127,18 @@ def apply_config_update(cfg):
         log.info(f'Config updated successfully: {updated_keys}')
     else:
         log.info('update-config: no changes applied')
+
+    service_name = cfg.get('service_name', '')
+    if service_name and updated_keys:
+        log.info(f'Restarting service: {service_name}')
+        try:
+            subprocess.run(
+                ['systemctl', '--user', 'restart', service_name],
+                timeout=10,
+                check=True,
+            )
+        except Exception as e:
+            log.error(f'Service restart failed: {e}')
 
     return True
 

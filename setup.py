@@ -82,6 +82,10 @@ def configure_cli(cfg):
     print("=" * 60)
     print()
 
+    default = cfg.get('service_name', 'ac_bridge')
+    val = input(f"  Systemd Service-Name [{default}]: ").strip()
+    cfg['service_name'] = val or default
+
     default = cfg.get('cli_command', '')
     val = input(f"  CLI Befehl (voller Pfad) [{default or 'z.B. /usr/local/bin/claude'}]: ").strip()
     cfg['cli_command'] = val or default
