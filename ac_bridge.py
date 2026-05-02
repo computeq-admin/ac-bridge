@@ -19,6 +19,7 @@ Konfiguration: config.json im gleichen Verzeichnis
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -46,6 +47,15 @@ log = logging.getLogger('ac_bridge')
 # ─────────────────────────────────────────────
 CONFIG_FILE = Path(__file__).parent / 'config.json'
 
+PROTECTED_CONFIG_KEYS = {
+    'token_a', 'mqtt_host', 'mqtt_port', 'mqtt_user',
+    'mqtt_password', 'mqtt_tls', 'server_url', 'token_b',
+}
+
+ALLOWED_CLI_EXECUTABLES = {
+    'claude', 'openclaw', 'copilot', 'gemini', 'aider', 'interpreter', 'goose',
+}
+
 def load_config():
     if not CONFIG_FILE.exists():
         log.error('config.json not found. Run setup first.')
@@ -56,6 +66,44 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
+
+def apply_config_update(cfg, new_params):
+    """Aktualisiert veränderliche Config-Felder; schützt feste MQTT/Auth-Parameter.
+
+    Wird via MQTT action=update-config ausgelöst. Wenn neue_params ein cli_command
+    enthält, muss dessen Basename in ALLOWED_CLI_EXECUTABLES stehen, sonst wird
+    das gesamte Update abgelehnt.
+    """
+    if 'cli_command' in new_params:
+        executable = Path(new_params['cli_command']).name
+        if executable not in ALLOWED_CLI_EXECUTABLES:
+            log.error(
+                f'update-config rejected: cli_command executable "{executable}" '
+                f'is not in the allowed list {sorted(ALLOWED_CLI_EXECUTABLES)}'
+            )
+            return False
+
+    updated_keys = []
+    skipped_keys = []
+    for key, value in new_params.items():
+        if key == 'action':
+            continue
+        if key in PROTECTED_CONFIG_KEYS:
+            skipped_keys.append(key)
+        else:
+            cfg[key] = value
+            updated_keys.append(key)
+
+    if skipped_keys:
+        log.warning(f'update-config: protected keys ignored: {skipped_keys}')
+
+    if updated_keys:
+        save_config(cfg)
+        log.info(f'Config updated successfully: {updated_keys}')
+    else:
+        log.info('update-config: no changes applied')
+
+    return True
 
 # ─────────────────────────────────────────────
 # Server API calls
@@ -192,8 +240,8 @@ def call_agent_cli(cfg, prompt, system_prompt=''):
     if sp_param and system_prompt:
         cmd += [sp_param, system_prompt]
 
-    for arg in cfg.get('cli_extra_params', []):
-        cmd.append(str(arg))
+    for arg in shlex.split(cfg.get('cli_extra_params', '')):
+        cmd.append(arg)
 
     prompt_param = cfg.get('cli_prompt_param', '')
     if prompt_param:
@@ -329,6 +377,8 @@ def on_message(client, userdata, msg):
         process_wakeup(cfg)
     elif action == 'ping':
         send_pong(cfg)
+    elif action == 'update-config':
+        apply_config_update(cfg, payload)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 

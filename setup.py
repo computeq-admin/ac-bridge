@@ -17,7 +17,6 @@ Usage:
 import json
 import os
 import secrets
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -120,15 +119,14 @@ def configure_cli(cfg):
     val = input(f"  Timeout in Sekunden [{default}]: ").strip()
     cfg['cli_timeout'] = int(val) if val.isdigit() else default
 
-    existing_extra = cfg.get('cli_extra_params', [])
-    default_str = ' '.join(existing_extra) if existing_extra else 'keine'
-    print(f"  Weitere Parameter [{default_str}]")
-    print("  (Leerzeichen-getrennt, z.B. --no-color --output-format text)")
+    existing_extra = cfg.get('cli_extra_params', '')
+    print(f"  Weitere Parameter [{existing_extra or 'keine'}]")
+    print("  (Leerzeichen-getrennt, z.B. --no-color --output-format json)")
     val = input("  > ").strip()
     if val:
-        cfg['cli_extra_params'] = shlex.split(val)
+        cfg['cli_extra_params'] = val
     elif not existing_extra:
-        cfg['cli_extra_params'] = []
+        cfg['cli_extra_params'] = ''
 
     print()
     print("  Umgebungsvariablen (Format: KEY=VALUE, leere Zeile zum Abschluss)")
