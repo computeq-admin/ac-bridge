@@ -296,9 +296,8 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             for fp in files:
                 cmd += [file_param, fp]
         else:
-            # Pfade dem Prompt voranstellen wenn kein dedizierter Parameter
-            file_note = '\n'.join(f'Attached file: {fp}' for fp in files)
-            prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
+            log.warning('Files received but cli_file_param is not configured.')
+            return None
 
     prompt_param = cfg.get('cli_prompt_param', '')
     if prompt_param:
@@ -571,7 +570,9 @@ def telegram_poll_loop(cfg):
             if attachment_info:
                 kind, attachment = attachment_info
                 file_id  = attachment.get('file_id', '')
-                dest_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+                base_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+                dest_dir = str(Path(base_dir) / 'session_files')
+                Path(dest_dir).mkdir(parents=True, exist_ok=True)
                 log.info(f'Telegram attachment: {kind} (file_id={file_id})')
                 local_path = telegram_download_file(token, file_id, dest_dir)
                 if local_path:
@@ -605,9 +606,14 @@ def telegram_poll_loop(cfg):
                 telegram_send(token, chat_id, answer)
             else:
                 lang = cfg.get('lang', 'DE')
-                err  = ('Es ist leider ein Fehler aufgetreten. Bitte versuche es erneut.'
-                        if lang == 'DE' else
-                        'An error occurred. Please try again.')
+                if downloaded_files and not cfg.get('cli_file_param'):
+                    err = ('Dateianhänge werden erst nach Konfiguration des File-Parameters im Backend unterstützt.'
+                           if lang == 'DE' else
+                           'File attachments require a configured file parameter in the backend.')
+                else:
+                    err = ('Es ist leider ein Fehler aufgetreten. Bitte versuche es erneut.'
+                           if lang == 'DE' else
+                           'An error occurred. Please try again.')
                 telegram_send(token, chat_id, err)
 
 
