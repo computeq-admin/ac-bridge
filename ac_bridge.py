@@ -256,13 +256,17 @@ def store_session_id(session_id):
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
-def call_agent_cli(cfg, prompt, system_prompt=''):
+def call_agent_cli(cfg, prompt, system_prompt='', files=None):
     """Ruft den KI-Agenten als lokalen CLI-Prozess auf, gibt Antwort-Text zurück.
 
     Session-Handling:
       - Kein _current_session_id → kein --resume, neuer Session-Start
       - _current_session_id gesetzt → --resume <id> wird übergeben
       - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert)
+
+    files: optionale Liste lokaler Dateipfade die an den Agenten übergeben werden.
+      - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
+      - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
     """
     if not cfg.get('cli_command'):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
@@ -284,6 +288,17 @@ def call_agent_cli(cfg, prompt, system_prompt=''):
 
     for arg in shlex.split(cfg.get('cli_extra_params', '')):
         cmd.append(arg)
+
+    # Dateianhänge einbauen
+    file_param = cfg.get('cli_file_param', '')
+    if files:
+        if file_param:
+            for fp in files:
+                cmd += [file_param, fp]
+        else:
+            # Pfade dem Prompt voranstellen wenn kein dedizierter Parameter
+            file_note = '\n'.join(f'Attached file: {fp}' for fp in files)
+            prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
 
     prompt_param = cfg.get('cli_prompt_param', '')
     if prompt_param:
@@ -433,6 +448,35 @@ def on_disconnect(client, userdata, rc):
 # ─────────────────────────────────────────────
 # Telegram long-polling
 # ─────────────────────────────────────────────
+def telegram_download_file(token, file_id, dest_dir):
+    """Lädt eine Telegram-Datei herunter, gibt den lokalen Pfad zurück oder None."""
+    try:
+        r = requests.get(
+            f'https://api.telegram.org/bot{token}/getFile',
+            params={'file_id': file_id},
+            timeout=10,
+        )
+        data = r.json()
+        if not data.get('ok'):
+            log.error(f'Telegram getFile failed: {data}')
+            return None
+
+        remote_path = data['result']['file_path']
+        ext         = Path(remote_path).suffix
+
+        r2   = requests.get(
+            f'https://api.telegram.org/file/bot{token}/{remote_path}',
+            timeout=60,
+        )
+        dest = Path(dest_dir) / f'tg_{file_id}{ext}'
+        dest.write_bytes(r2.content)
+        log.info(f'Telegram file downloaded: {dest} ({len(r2.content)} bytes)')
+        return str(dest)
+    except Exception as e:
+        log.error(f'Telegram file download failed: {e}')
+        return None
+
+
 def telegram_send(token, chat_id, text):
     """Sendet eine Nachricht via Telegram Bot API."""
     url = f'https://api.telegram.org/bot{token}/sendMessage'
@@ -512,10 +556,32 @@ def telegram_poll_loop(cfg):
                 log.debug(f'Telegram: message from unknown chat {sender_id}, ignored.')
                 continue
 
-            if not text:
+            # Text aus message oder caption (bei Dateianhängen)
+            text = (msg.get('text') or msg.get('caption') or '').strip()
+
+            # Dateianhang erkennen und herunterladen
+            attachment_info = None
+            if   'photo'    in msg: attachment_info = ('photo',    msg['photo'][-1])
+            elif 'document' in msg: attachment_info = ('document', msg['document'])
+            elif 'audio'    in msg: attachment_info = ('audio',    msg['audio'])
+            elif 'video'    in msg: attachment_info = ('video',    msg['video'])
+            elif 'voice'    in msg: attachment_info = ('voice',    msg['voice'])
+
+            downloaded_files = []
+            if attachment_info:
+                kind, attachment = attachment_info
+                file_id  = attachment.get('file_id', '')
+                dest_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+                log.info(f'Telegram attachment: {kind} (file_id={file_id})')
+                local_path = telegram_download_file(token, file_id, dest_dir)
+                if local_path:
+                    downloaded_files.append(local_path)
+
+            if not text and not downloaded_files:
                 continue
 
-            log.info(f'Telegram message from {sender_name} ({sender_id}): {text!r}')
+            log.info(f'Telegram message from {sender_name} ({sender_id}): {text!r}'
+                     + (f' + {len(downloaded_files)} file(s)' if downloaded_files else ''))
 
             if not cfg.get('cli_command'):
                 log.warning('Telegram: no cli_command configured, cannot process message.')
@@ -525,7 +591,14 @@ def telegram_poll_loop(cfg):
             system_prompt = cfg.get('telegram_system_prompt', '')
             telegram_send_typing(token, chat_id)
 
-            answer = call_agent_cli(cfg, text, system_prompt)
+            answer = call_agent_cli(cfg, text, system_prompt, files=downloaded_files or None)
+
+            # Temp-Dateien aufräumen
+            for fp in downloaded_files:
+                try:
+                    Path(fp).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if answer:
                 log.info(f'Telegram answer ({len(answer)} chars) sent to {sender_id}')
