@@ -272,7 +272,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
         return None
 
-    cmd = [cfg['cli_command']]
+    cmd = [os.path.expanduser(cfg['cli_command'])]
 
     # Session fortsetzen wenn ID vorhanden (vom letzten erfolgreichen Call)
     session_param = cfg.get('cli_session_id_param', '')
@@ -313,7 +313,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
 
-    cwd     = cfg.get('cli_working_dir') or None
+    cwd     = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     timeout = cfg.get('cli_timeout', 600)
 
     log.info(f'Calling CLI agent: {cmd[0]} (timeout={timeout}s, cwd={cwd})')
