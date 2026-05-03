@@ -293,13 +293,24 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
 
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
 
-    # Session fortsetzen wenn ID vorhanden (vom letzten erfolgreichen Call)
-    session_param = cfg.get('cli_session_id_param', '')
-    if session_param and _current_session_id:
-        cmd += [session_param, _current_session_id]
-        log.info(f'Continuing session: {_current_session_id}')
-    else:
-        log.info('Starting new session (no resume)')
+    # Session-Handling
+    session_param    = cfg.get('cli_session_id_param', '')
+    session_id_field = cfg.get('cli_session_id_output_field', '')
+
+    if session_param:
+        if _current_session_id:
+            cmd += [session_param, _current_session_id]
+            log.info(f'Continuing session: {_current_session_id}')
+        elif not session_id_field:
+            # Input-Modus (z.B. openclaw): Session-ID wird immer übergeben,
+            # kommt nicht aus dem Output → neue UUID generieren
+            import uuid as _uuid
+            new_id = str(_uuid.uuid4())
+            store_session_id(new_id)
+            cmd += [session_param, new_id]
+            log.info(f'New session (generated ID): {new_id}')
+        else:
+            log.info('Starting new session (no resume)')
 
     sp_param = cfg.get('cli_system_prompt_param', '')
     if sp_param and system_prompt:
@@ -357,16 +368,16 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             log.error('CLI returned empty output')
             return None
 
-        # JSON-Output parsen wenn konfiguriert (z.B. claude --output-format json)
-        session_id_field = cfg.get('cli_session_id_output_field', '')
-        if session_id_field:
+        # JSON-Output parsen wenn session_id_field gesetzt ODER answer_field Dot-Notation enthält
+        answer_field     = cfg.get('cli_answer_output_field', 'result')
+        parse_json       = bool(session_id_field) or '.' in answer_field
+        if parse_json:
             try:
                 data = json.loads(raw)
-                # Session-ID für nächsten Call speichern
-                new_sid = json_get(data, session_id_field) or ''
-                if new_sid:
-                    store_session_id(str(new_sid))
-                answer_field = cfg.get('cli_answer_output_field', 'result')
+                if session_id_field:
+                    new_sid = json_get(data, session_id_field) or ''
+                    if new_sid:
+                        store_session_id(str(new_sid))
                 answer = (json_get(data, answer_field) or '').strip()
                 if not answer:
                     log.error(f'JSON output has no "{answer_field}" field: {raw[:200]}')
