@@ -144,6 +144,19 @@ loginctl enable-linger $USER
 
 The service name is `ac_bridge-<email>` (e.g. `ac_bridge-user-example.com`).
 
+## Update
+
+```bash
+cd ~/ac-bridge   # or wherever you cloned the repo
+git pull
+systemctl --user restart $(grep service_name config.json | cut -d'"' -f4)
+```
+
+Or if you know the service name:
+```bash
+systemctl --user restart ac_bridge-user-example.com
+```
+
 ## Re-setup (reset connection)
 
 ```bash
