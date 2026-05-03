@@ -296,8 +296,13 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             for fp in files:
                 cmd += [file_param, fp]
         else:
-            log.warning('Files received but cli_file_param is not configured.')
-            return None
+            # Kein CLI-Flag konfiguriert: Dateipfad im Prompt nennen.
+            # Claude Code CLI hat den Read-Tool und liest die Datei selbst.
+            file_note = '\n'.join(
+                f'The user sent the following file, please read and process it: {Path(fp).resolve()}'
+                for fp in files
+            )
+            prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
 
     prompt_param = cfg.get('cli_prompt_param', '')
     if prompt_param:
@@ -606,14 +611,9 @@ def telegram_poll_loop(cfg):
                 telegram_send(token, chat_id, answer)
             else:
                 lang = cfg.get('lang', 'DE')
-                if downloaded_files and not cfg.get('cli_file_param'):
-                    err = ('Dateianhänge werden erst nach Konfiguration des File-Parameters im Backend unterstützt.'
-                           if lang == 'DE' else
-                           'File attachments require a configured file parameter in the backend.')
-                else:
-                    err = ('Es ist leider ein Fehler aufgetreten. Bitte versuche es erneut.'
-                           if lang == 'DE' else
-                           'An error occurred. Please try again.')
+                err = ('Es ist leider ein Fehler aufgetreten. Bitte versuche es erneut.'
+                       if lang == 'DE' else
+                       'An error occurred. Please try again.')
                 telegram_send(token, chat_id, err)
 
 
