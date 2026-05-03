@@ -595,6 +595,15 @@ def telegram_poll_loop(cfg):
             # Text aus message oder caption (bei Dateianhängen)
             text = (msg.get('text') or msg.get('caption') or '').strip()
 
+            # /new — neue Session starten
+            if text.lower() in ('/new', '/new@' + token.split(':')[0]):
+                reset_session()
+                lang = cfg.get('lang', 'DE')
+                confirm = ('Neue Session gestartet.' if lang == 'DE' else 'New session started.')
+                telegram_send(token, chat_id, confirm)
+                log.info(f'Telegram /new: session reset by {sender_name}')
+                continue
+
             # Dateianhang erkennen und herunterladen
             attachment_info = None
             if   'photo'    in msg: attachment_info = ('photo',    msg['photo'][-1])
