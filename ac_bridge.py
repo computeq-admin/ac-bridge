@@ -433,11 +433,33 @@ def on_disconnect(client, userdata, rc):
 # ─────────────────────────────────────────────
 # Telegram long-polling
 # ─────────────────────────────────────────────
+def telegram_send(token, chat_id, text):
+    """Sendet eine Nachricht via Telegram Bot API."""
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    try:
+        requests.post(
+            url,
+            json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
+            timeout=10,
+        )
+    except Exception as e:
+        log.error(f'Telegram send failed: {e}')
+
+
+def telegram_send_typing(token, chat_id):
+    """Sendet 'typing…' Indicator."""
+    url = f'https://api.telegram.org/bot{token}/sendChatAction'
+    try:
+        requests.post(url, json={'chat_id': chat_id, 'action': 'typing'}, timeout=5)
+    except Exception:
+        pass
+
+
 def telegram_poll_loop(cfg):
     """Lauscht per long-poll auf eingehende Telegram-Nachrichten.
 
-    Nur Nachrichten von der konfigurierten telegram_chat_id werden
-    verarbeitet — aktuell werden sie ins Log geschrieben.
+    Nachrichten von telegram_chat_id werden an die KI weitergeleitet;
+    die Antwort geht direkt per Telegram zurück.
     Läuft als Daemon-Thread parallel zum MQTT-Loop.
     """
     offset     = 0
@@ -484,13 +506,36 @@ def telegram_poll_loop(cfg):
             msg         = update.get('message', {})
             sender_id   = str(msg.get('chat', {}).get('id', ''))
             sender_name = msg.get('chat', {}).get('first_name', sender_id)
-            text        = msg.get('text', '')
+            text        = msg.get('text', '').strip()
 
             if sender_id != chat_id:
                 log.debug(f'Telegram: message from unknown chat {sender_id}, ignored.')
                 continue
 
+            if not text:
+                continue
+
             log.info(f'Telegram message from {sender_name} ({sender_id}): {text!r}')
+
+            if not cfg.get('cli_command'):
+                log.warning('Telegram: no cli_command configured, cannot process message.')
+                telegram_send(token, chat_id, '⚠️ Bridge nicht konfiguriert. Bitte CLI-Konfiguration im Backend setzen.')
+                continue
+
+            system_prompt = cfg.get('telegram_system_prompt', '')
+            telegram_send_typing(token, chat_id)
+
+            answer = call_agent_cli(cfg, text, system_prompt)
+
+            if answer:
+                log.info(f'Telegram answer ({len(answer)} chars) sent to {sender_id}')
+                telegram_send(token, chat_id, answer)
+            else:
+                lang = cfg.get('lang', 'DE')
+                err  = ('Es ist leider ein Fehler aufgetreten. Bitte versuche es erneut.'
+                        if lang == 'DE' else
+                        'An error occurred. Please try again.')
+                telegram_send(token, chat_id, err)
 
 
 # ─────────────────────────────────────────────
