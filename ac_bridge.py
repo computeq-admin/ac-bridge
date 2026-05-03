@@ -23,6 +23,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -430,6 +431,69 @@ def on_disconnect(client, userdata, rc):
 
 
 # ─────────────────────────────────────────────
+# Telegram long-polling
+# ─────────────────────────────────────────────
+def telegram_poll_loop(cfg):
+    """Lauscht per long-poll auf eingehende Telegram-Nachrichten.
+
+    Nur Nachrichten von der konfigurierten telegram_chat_id werden
+    verarbeitet — aktuell werden sie ins Log geschrieben.
+    Läuft als Daemon-Thread parallel zum MQTT-Loop.
+    """
+    offset     = 0
+    prev_token = ''
+
+    while True:
+        token   = cfg.get('telegram_bot_token', '')
+        chat_id = str(cfg.get('telegram_chat_id', ''))
+
+        if not token or not chat_id:
+            time.sleep(30)
+            continue
+
+        # Offset zurücksetzen wenn sich der Token geändert hat
+        if token != prev_token:
+            offset     = 0
+            prev_token = token
+            log.info('Telegram polling started.')
+
+        url    = f'https://api.telegram.org/bot{token}/getUpdates'
+        params = {
+            'offset':          offset,
+            'timeout':         30,
+            'allowed_updates': json.dumps(['message']),
+        }
+
+        try:
+            r    = requests.get(url, params=params, timeout=35)
+            data = r.json()
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            log.warning(f'Telegram poll error: {e}, retrying in 10s...')
+            time.sleep(10)
+            continue
+
+        if not data.get('ok'):
+            log.warning(f'Telegram getUpdates failed: {data}')
+            time.sleep(10)
+            continue
+
+        for update in data.get('result', []):
+            offset      = update['update_id'] + 1
+            msg         = update.get('message', {})
+            sender_id   = str(msg.get('chat', {}).get('id', ''))
+            sender_name = msg.get('chat', {}).get('first_name', sender_id)
+            text        = msg.get('text', '')
+
+            if sender_id != chat_id:
+                log.debug(f'Telegram: message from unknown chat {sender_id}, ignored.')
+                continue
+
+            log.info(f'Telegram message from {sender_name} ({sender_id}): {text!r}')
+
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 def main():
@@ -465,6 +529,12 @@ def main():
 
     log.info(f"AC Bridge starting — server: {cfg['server_url']}")
     log.info(f"MQTT: {cfg['mqtt_host']}:{cfg['mqtt_port']}, topic: ac/{cfg['token_a']}")
+
+    tg_thread = threading.Thread(
+        target=telegram_poll_loop, args=(cfg,), daemon=True, name='tg-poll'
+    )
+    tg_thread.start()
+    log.info('Telegram polling thread started.')
 
     while True:
         try:
