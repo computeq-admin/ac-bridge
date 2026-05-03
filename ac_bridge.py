@@ -236,6 +236,25 @@ def put_answer(cfg, job_id, answer):
 
 
 # ─────────────────────────────────────────────
+# JSON helpers
+# ─────────────────────────────────────────────
+def json_get(data, path):
+    """Liest einen Wert aus verschachteltem JSON per Dot-Notation.
+    Beispiel: json_get(data, 'result.meta.agentMeta.sessionId')
+    Gibt None zurück wenn der Pfad nicht existiert.
+    """
+    val = data
+    for part in path.split('.'):
+        if isinstance(val, dict):
+            val = val.get(part)
+        elif isinstance(val, list) and part.isdigit():
+            val = val[int(part)]
+        else:
+            return None
+    return val
+
+
+# ─────────────────────────────────────────────
 # Session management
 # ─────────────────────────────────────────────
 _current_session_id = None
@@ -272,7 +291,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
         return None
 
-    cmd = [os.path.expanduser(cfg['cli_command'])]
+    cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
 
     # Session fortsetzen wenn ID vorhanden (vom letzten erfolgreichen Call)
     session_param = cfg.get('cli_session_id_param', '')
@@ -344,12 +363,11 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             try:
                 data = json.loads(raw)
                 # Session-ID für nächsten Call speichern
-                new_sid = data.get(session_id_field, '')
+                new_sid = json_get(data, session_id_field) or ''
                 if new_sid:
-                    store_session_id(new_sid)
-                # Antworttext aus "result"-Feld (Claude CLI) oder konfigurierbarem Feld
+                    store_session_id(str(new_sid))
                 answer_field = cfg.get('cli_answer_output_field', 'result')
-                answer = data.get(answer_field, '').strip()
+                answer = (json_get(data, answer_field) or '').strip()
                 if not answer:
                     log.error(f'JSON output has no "{answer_field}" field: {raw[:200]}')
                     return None
