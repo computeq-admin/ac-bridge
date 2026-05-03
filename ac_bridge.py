@@ -313,8 +313,11 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             log.info('Starting new session (no resume)')
 
     sp_param = cfg.get('cli_system_prompt_param', '')
-    if sp_param and system_prompt:
-        cmd += [sp_param, system_prompt]
+    if system_prompt:
+        if sp_param:
+            cmd += [sp_param, system_prompt]
+        else:
+            prompt = f'{system_prompt}\n\n{prompt}' if prompt else system_prompt
 
     for arg in shlex.split(cfg.get('cli_extra_params', '')):
         cmd.append(arg)
