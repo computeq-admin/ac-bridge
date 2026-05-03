@@ -160,7 +160,123 @@ def configure_cli(cfg):
     return cfg
 
 
+def cmd_get_token():
+    """--get-token: Token-A anzeigen oder neu generieren (nicht-interaktiv, KI-geeignet)."""
+    cfg = load_or_create_config()
+
+    if cfg.get('token_b'):
+        print('INFO: Bridge ist bereits vollständig eingerichtet.')
+        print(f"Token-A: {cfg['token_a']}")
+        print('Um neu einzurichten: python3 setup.py --setup')
+        sys.exit(0)
+
+    if cfg.get('token_a'):
+        print('INFO: Setup läuft bereits (Token-A vorhanden, OTT noch nicht eingelöst).')
+        print(f"Token-A: {cfg['token_a']}")
+        sys.exit(0)
+
+    token_a = generate_token_a()
+    cfg['token_a'] = token_a
+    cfg.pop('token_b', None)
+    save_config(cfg)
+    print(f"Token-A: {token_a}")
+    sys.exit(0)
+
+
+def cmd_redeem_ott(ott):
+    """--redeem-ott <OTT>: OTT einlösen und Setup abschließen (nicht-interaktiv, KI-geeignet)."""
+    cfg = load_or_create_config()
+
+    if not cfg.get('token_a'):
+        print('Fehler: Kein Token-A gefunden.')
+        print('Bitte zuerst ausführen: python3 setup.py --get-token')
+        sys.exit(1)
+
+    print('Löse OTT ein ...')
+    try:
+        r = requests.post(
+            DEFAULT_SERVER + '/redeem_ott.php',
+            json={'token_a': cfg['token_a'], 'ott': ott},
+            timeout=15,
+        )
+        data = r.json()
+    except Exception as e:
+        print(f'Fehler beim Server-Aufruf: {e}')
+        sys.exit(1)
+
+    if r.status_code != 200 or 'token_b' not in data:
+        err = data.get('error', 'unknown')
+        print(f'Fehler: {err}')
+        if err == 'ott_expired':
+            print('Der OTT ist abgelaufen (10 Min). Bitte neu anfordern.')
+        elif err == 'ott_already_used':
+            print('Dieser OTT wurde bereits verwendet.')
+        elif err == 'token_a_not_found':
+            print('Token-A nicht gefunden. Bitte Token-A im Portal zuerst eintragen.')
+        sys.exit(1)
+
+    cfg['token_b']       = data['token_b']
+    cfg['mqtt_host']     = data['mqtt_host']
+    cfg['mqtt_port']     = data['mqtt_port']
+    cfg['mqtt_user']     = data['mqtt_user']
+    cfg['mqtt_password'] = data['mqtt_password']
+    cfg['mqtt_tls']      = data.get('mqtt_tls', False)
+    cfg['server_url']    = data.get('server_url', DEFAULT_SERVER)
+
+    user_email          = data.get('user_email', '')
+    service_name        = sanitize_service_name(user_email) if user_email else 'ac_bridge'
+    cfg['service_name'] = service_name
+
+    cfg.setdefault('cli_command',                '')
+    cfg.setdefault('cli_working_dir',            '')
+    cfg.setdefault('cli_prompt_param',           '-p')
+    cfg.setdefault('cli_system_prompt_param',    '--system-prompt')
+    cfg.setdefault('cli_session_id_param',       '')
+    cfg.setdefault('cli_session_id_output_field','')
+    cfg.setdefault('cli_answer_output_field',    'result')
+    cfg.setdefault('cli_timeout',                600)
+    cfg.setdefault('cli_extra_params',           '')
+    cfg.setdefault('cli_env',                    {})
+    cfg['lang'] = 'DE'
+
+    save_config(cfg)
+    print(f'✓ Verbindung hergestellt')
+    if user_email:
+        print(f'✓ User: {user_email}')
+    print(f'✓ Service-Name: {service_name}')
+    print(f'✓ config.json gespeichert (Berechtigungen: 600)')
+
+    if '--no-service' not in sys.argv:
+        install_service(Path(__file__).parent, service_name)
+        try:
+            subprocess.run(
+                ['loginctl', 'enable-linger', os.environ.get('USER', '')],
+                check=True, capture_output=True,
+            )
+            print('✓ loginctl linger aktiviert (Service startet ohne Login)')
+        except Exception:
+            print('  Hinweis: loginctl enable-linger manuell ausführen für Auto-Start')
+
+    print()
+    print('Setup abgeschlossen! Die Bridge läuft jetzt als systemd user service.')
+    print(f'Logs:    journalctl --user -u {service_name} -f')
+    print(f'Status:  systemctl --user status {service_name}')
+    sys.exit(0)
+
+
 def main():
+    # ── Nicht-interaktive Befehle (KI-geeignet) ──────────────────────────────
+    if '--get-token' in sys.argv:
+        cmd_get_token()
+
+    if '--redeem-ott' in sys.argv:
+        idx = sys.argv.index('--redeem-ott')
+        if idx + 1 >= len(sys.argv):
+            print('Fehler: Kein OTT angegeben.')
+            print('Verwendung: python3 setup.py --redeem-ott <OTT>')
+            sys.exit(1)
+        cmd_redeem_ott(sys.argv[idx + 1].strip())
+
     # ── Nur Agent-Konfiguration (ohne Neuverbindung) ──────────────────────────
     if '--config' in sys.argv:
         cfg = load_or_create_config()

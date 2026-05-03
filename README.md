@@ -1,97 +1,153 @@
 # AC Bridge — Agent Connect
 
-Verbindet deinen lokalen KI-Agenten mit dem Alexa Skill "Agent Connect" und der iOS App Agent Connect.
+Connects your local AI agent CLI to the **Agent Connect** platform — usable via Alexa skill, iOS/Siri Shortcuts, and Telegram.
 
-## Voraussetzungen
+The bridge runs as a systemd user service, listens for MQTT wakeup signals, calls your local CLI agent, and returns the answer to the server.
+
+## Requirements
 
 - Python 3.8+
 - `python3-venv` (`sudo apt install python3-venv`)
-- Laufender KI-Agent mit OpenAI-kompatiblem API-Endpunkt (z.B. OpenWebUI)
-- Account auf https://agent-connect.computeq.de
+- A local AI agent with a CLI interface (e.g. Claude CLI, OpenClaw, Aider, Goose …)
+- An account at https://agent-connect.computeq.de
 
 ## Installation
 
 ```bash
-# 1. Repository klonen
+# 1. Clone the repository
 git clone https://github.com/computeq-admin/ac-bridge.git
 cd ac-bridge
 
-# 2. Installation (erstellt venv, installiert Dependencies)
+# 2. Install (creates venv, installs dependencies)
 ./install.sh
-
-# 3. Einrichtung (interaktiv)
-./start.sh --setup
 ```
 
-## Einrichtung (setup.py)
+## Setup
 
-Das Setup-Skript führt dich durch folgende Schritte:
-
-1. **Token-A generieren** — eindeutige ID deiner Bridge-Installation
-2. **Token-A im Webportal eintragen** → https://agent-connect.computeq.de/
-3. **OTT (One-Time-Token) eingeben** — vom Portal zurückgegeben
-4. **Agent-Endpunkt konfigurieren** — URL + API-Token deines KI-Agenten
-5. **MQTT konfigurieren** — Verbindungsdaten vom Portal
-
-Am Ende wird `config.json` gespeichert (Berechtigungen: 600).
-
-## Bridge starten
-
-```bash
-# Manuell
-./start.sh
-
-# Als Systemd Service
-sudo cp ac_bridge.service /etc/systemd/system/
-# YOUR_USER in der Service-Datei anpassen!
-sudo nano /etc/systemd/system/ac_bridge.service
-sudo systemctl enable --now ac_bridge
-
-# Logs
-journalctl -u ac_bridge -f
-# oder
-tail -f ac_bridge.log
-```
-
-## Konfiguration (config.json)
-
-Wird von setup.py automatisch erstellt. Felder:
-
-| Feld             | Beschreibung                                      |
-|------------------|---------------------------------------------------|
-| `token_a`        | Bridge-Identifikation (nicht ändern!)             |
-| `token_b`        | Rotierender API-Token (wird automatisch erneuert) |
-| `server_url`     | URL des AC-Servers                               |
-| `agent_endpoint` | OpenAI-kompatibler Endpunkt deines Agenten        |
-| `agent_token`    | API-Token für den Agenten                         |
-| `agent_model`    | Modell-Name (z.B. `chatcompletion`)               |
-| `agent_timeout`  | Timeout in Sekunden (Standard: 120)               |
-| `mqtt_host`      | MQTT Broker Host                                  |
-| `mqtt_port`      | MQTT Broker Port (Standard: 1883)                 |
-| `mqtt_user`      | MQTT Benutzername                                 |
-| `mqtt_password`  | MQTT Passwort                                     |
-| `mqtt_tls`       | TLS verwenden (true/false)                        |
-
-## Ablauf
-
-```
-Alexa → AC Server → MQTT Wakeup → Bridge
-                                      ↓
-                              Job von Server holen
-                                      ↓
-                              KI-Agent aufrufen
-                                      ↓
-                              Antwort an Server
-                                      ↓
-                         Optional: Telegram-Benachrichtigung
-                                      ↓
-                              Alexa liest Antwort vor
-```
-
-## Neu einrichten (Token zurücksetzen)
+### Option A — Interactive (for humans)
 
 ```bash
 ./start.sh --setup
-# → wähle "Neu konfigurieren" → neues Token-A wird generiert
-# → altes Token-A im Portal durch neues ersetzen
+```
+
+Guides you through all steps interactively.
+
+### Option B — Non-interactive (for AI agents)
+
+Designed so an AI agent can set up the bridge on behalf of the user:
+
+**Step 1 — Generate Token-A:**
+```bash
+python3 setup.py --get-token
+```
+Output: `Token-A: <64-char hex token>`
+
+The AI should show this token to the user and ask them to open
+https://agent-connect.computeq.de, go to "Set up connection",
+enter the Token-A, and click "Request OTT".
+
+**Step 2 — Redeem the OTT the user received:**
+```bash
+python3 setup.py --redeem-ott <OTT>
+```
+This contacts the server, saves all credentials to `config.json`,
+installs the systemd user service, and starts the bridge.
+
+Optional flag: `--no-service` skips service installation.
+
+**Step 3 — Configure the CLI agent:**
+
+Open https://agent-connect.computeq.de and go to "Configure Bridge".
+Use the preset buttons (e.g. "Claude CLI Defaults") to fill in the parameters,
+then click "Send config". The bridge receives the config via MQTT automatically.
+
+### AI agent instructions (copy-paste for your AI)
+
+> Help me set up the AC Bridge:
+> 1. Clone https://github.com/computeq-admin/ac-bridge.git and run `./install.sh`
+> 2. Run `python3 setup.py --get-token` and show me the Token-A
+> 3. I will open https://agent-connect.computeq.de and get an OTT — tell me when you're ready
+> 4. Run `python3 setup.py --redeem-ott <OTT I provide>`
+> 5. The bridge is now running. I'll configure the CLI agent via the web portal.
+
+## CLI commands reference
+
+| Command | Description |
+|---|---|
+| `./start.sh --setup` | Interactive full setup |
+| `python3 setup.py --get-token` | Show / generate Token-A (non-interactive) |
+| `python3 setup.py --redeem-ott <OTT>` | Redeem OTT and complete setup (non-interactive) |
+| `python3 setup.py --redeem-ott <OTT> --no-service` | Same, skip systemd service install |
+| `python3 setup.py --config` | Reconfigure CLI agent locally (interactive) |
+| `./start.sh` | Start bridge manually (no service) |
+
+## Configuration (config.json)
+
+Created automatically by setup. Credentials are protected (chmod 600).
+
+| Field | Description |
+|---|---|
+| `token_a` | Bridge identity token (do not change) |
+| `token_b` | Rotating API token (auto-renewed on every server call) |
+| `server_url` | AC server URL |
+| `service_name` | systemd user service name (derived from account email) |
+| `mqtt_host/port/user/password/tls` | MQTT broker credentials (from server) |
+| `cli_command` | Full path to AI agent CLI (e.g. `~/.npm-global/bin/claude`) |
+| `cli_working_dir` | Working directory for the CLI process |
+| `cli_prompt_param` | Flag to pass the prompt (e.g. `-p`) |
+| `cli_system_prompt_param` | Flag for system prompt (e.g. `--system-prompt`) |
+| `cli_session_id_param` | Flag to resume a session (e.g. `--resume`) |
+| `cli_session_id_output_field` | JSON field name for session ID in output (dot-notation supported) |
+| `cli_answer_output_field` | JSON field name for answer text in output (dot-notation supported) |
+| `cli_extra_params` | Additional CLI flags (space-separated string) |
+| `cli_env` | Environment variables as JSON object |
+| `cli_file_param` | Flag to pass file attachments (leave empty for Claude CLI) |
+| `cli_timeout` | Timeout in seconds (default: 600) |
+| `telegram_bot_token` | Telegram bot token for direct chat |
+| `telegram_chat_id` | Telegram chat ID to accept messages from |
+| `telegram_system_prompt` | System prompt for Telegram conversations |
+| `lang` | Language for error messages: `DE` or `EN` |
+
+## How it works
+
+```
+Alexa / Siri / Telegram
+        ↓
+   AC Server
+        ↓ MQTT wakeup
+   AC Bridge (this)
+        ↓ HTTP pull
+   fetch job from server
+        ↓
+   call local CLI agent
+        ↓
+   return answer to server
+        ↓
+   Alexa reads answer / Telegram reply
+```
+
+## Service management
+
+```bash
+# Status
+systemctl --user status <service-name>
+
+# Restart
+systemctl --user restart <service-name>
+
+# Logs (live)
+journalctl --user -u <service-name> -f
+
+# Enable auto-start without login session
+loginctl enable-linger $USER
+```
+
+The service name is `ac_bridge-<email>` (e.g. `ac_bridge-user-example.com`).
+
+## Re-setup (reset connection)
+
+```bash
+./start.sh --setup
+# → choose "Re-configure" → new Token-A is generated
+# → enter new Token-A in the web portal
 ```
