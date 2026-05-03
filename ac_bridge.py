@@ -105,7 +105,7 @@ def apply_config_update(cfg):
     # cli_command Executable gegen Whitelist prüfen
     cli_command = data.get('cli_command', '')
     if cli_command:
-        executable = Path(cli_command).name
+        executable = Path(shlex.split(cli_command)[0]).name
         if executable not in ALLOWED_CLI_EXECUTABLES:
             log.error(
                 f'update-config rejected: cli_command executable "{executable}" '
