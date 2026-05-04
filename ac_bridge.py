@@ -513,17 +513,37 @@ def telegram_download_file(token, file_id, dest_dir):
         return None
 
 
-def telegram_send(token, chat_id, text):
-    """Sendet eine Nachricht via Telegram Bot API."""
-    url = f'https://api.telegram.org/bot{token}/sendMessage'
+TG_MAX_LEN = 4096
+
+
+def _tg_post(token, chat_id, text, parse_mode=None):
+    """Einzelner API-Call; gibt True bei Erfolg zurück."""
+    url  = f'https://api.telegram.org/bot{token}/sendMessage'
+    body = {'chat_id': chat_id, 'text': text}
+    if parse_mode:
+        body['parse_mode'] = parse_mode
     try:
-        requests.post(
-            url,
-            json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
-            timeout=10,
-        )
+        r    = requests.post(url, json=body, timeout=10)
+        data = r.json()
+        if not data.get('ok'):
+            log.warning(f'Telegram sendMessage failed ({parse_mode}): {data.get("description")}')
+            return False
+        return True
     except Exception as e:
         log.error(f'Telegram send failed: {e}')
+        return False
+
+
+def telegram_send(token, chat_id, text):
+    """Sendet eine Nachricht via Telegram Bot API.
+
+    Teilt lange Texte in Chunks auf (4096-Zeichen-Limit).
+    Versucht zuerst Markdown-Formatierung; bei Parse-Fehler Fallback auf Plain Text.
+    """
+    chunks = [text[i:i + TG_MAX_LEN] for i in range(0, len(text), TG_MAX_LEN)]
+    for chunk in chunks:
+        if not _tg_post(token, chat_id, chunk, parse_mode='Markdown'):
+            _tg_post(token, chat_id, chunk)
 
 
 def telegram_send_typing(token, chat_id):
