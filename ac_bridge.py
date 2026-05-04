@@ -684,36 +684,42 @@ def telegram_poll_loop(cfg):
 def main():
     cfg = load_config()
 
-    required = ['token_a', 'token_b', 'server_url',
-                'mqtt_host', 'mqtt_port', 'mqtt_user', 'mqtt_password']
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        log.error(f'Missing config keys: {missing}')
-        sys.exit(1)
+    telegram_only = cfg.get('telegram_only', False)
+    client = None
 
-    client = mqtt.Client(
-        client_id=f"ac-bridge-{cfg['token_a'][:8]}",
-        userdata=cfg,
-    )
-    client.username_pw_set(cfg['mqtt_user'], cfg['mqtt_password'])
-    client.on_connect    = on_connect
-    client.on_message    = on_message
-    client.on_disconnect = on_disconnect
+    if telegram_only:
+        log.info('AC Bridge starting in Telegram-only mode (no MQTT)')
+    else:
+        required = ['token_a', 'token_b', 'server_url',
+                    'mqtt_host', 'mqtt_port', 'mqtt_user', 'mqtt_password']
+        missing = [k for k in required if not cfg.get(k)]
+        if missing:
+            log.error(f'Missing config keys: {missing}')
+            sys.exit(1)
 
-    # TLS falls konfiguriert
-    if cfg.get('mqtt_tls', False):
-        client.tls_set()
+        client = mqtt.Client(
+            client_id=f"ac-bridge-{cfg['token_a'][:8]}",
+            userdata=cfg,
+        )
+        client.username_pw_set(cfg['mqtt_user'], cfg['mqtt_password'])
+        client.on_connect    = on_connect
+        client.on_message    = on_message
+        client.on_disconnect = on_disconnect
+
+        if cfg.get('mqtt_tls', False):
+            client.tls_set()
+
+        log.info(f"AC Bridge starting — server: {cfg['server_url']}")
+        log.info(f"MQTT: {cfg['mqtt_host']}:{cfg['mqtt_port']}, topic: ac/{cfg['token_a']}")
 
     def shutdown(sig, frame):
         log.info('Shutting down bridge...')
-        client.disconnect()
+        if client:
+            client.disconnect()
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
-
-    log.info(f"AC Bridge starting — server: {cfg['server_url']}")
-    log.info(f"MQTT: {cfg['mqtt_host']}:{cfg['mqtt_port']}, topic: ac/{cfg['token_a']}")
 
     tg_thread = threading.Thread(
         target=telegram_poll_loop, args=(cfg,), daemon=True, name='tg-poll'
@@ -721,13 +727,17 @@ def main():
     tg_thread.start()
     log.info('Telegram polling thread started.')
 
-    while True:
-        try:
-            client.connect(cfg['mqtt_host'], int(cfg['mqtt_port']), keepalive=60)
-            client.loop_forever()
-        except Exception as e:
-            log.error(f'MQTT connection error: {e}, retrying in 30s...')
-            time.sleep(30)
+    if telegram_only:
+        while True:
+            time.sleep(60)
+    else:
+        while True:
+            try:
+                client.connect(cfg['mqtt_host'], int(cfg['mqtt_port']), keepalive=60)
+                client.loop_forever()
+            except Exception as e:
+                log.error(f'MQTT connection error: {e}, retrying in 30s...')
+                time.sleep(30)
 
 
 if __name__ == '__main__':

@@ -26,6 +26,13 @@ import requests
 CONFIG_FILE = Path(__file__).parent / 'config.json'
 DEFAULT_SERVER = 'https://agent-connect.computeq.de'
 
+DEFAULT_TELEGRAM_SYSTEM_PROMPT = (
+    "Du bist ein hilfreicher Assistent. Deine Antworten werden per Telegram-Nachricht übermittelt.\n"
+    "Halte dich an die folgenden Regeln:\n\n"
+    "## Formatierung\n"
+    "Beschränke dich in den Antworten auf die in Telegram möglichen Markdown-Auszeichnungen."
+)
+
 
 def generate_token_a():
     return secrets.token_hex(32)  # 64 Zeichen hex
@@ -264,7 +271,123 @@ def cmd_redeem_ott(ott):
     sys.exit(0)
 
 
+def cmd_telegram_only():
+    """--telegram-only: Richtet die Bridge ohne MQTT nur für Telegram ein."""
+    cfg = load_or_create_config()
+
+    print()
+    print("=" * 60)
+    print("  AC Bridge — Telegram-Only Setup")
+    print("=" * 60)
+    print()
+    print("  Verbindet Telegram direkt mit dem lokalen KI-Agenten.")
+    print("  Keine MQTT/Server-Verbindung erforderlich.")
+    print()
+
+    default = cfg.get('user', os.environ.get('USER', ''))
+    val = input(f"  Benutzername [{default}]: ").strip()
+    cfg['user'] = val or default
+
+    service_name = 'ac_bridge_tg-' + (cfg['user'] or 'default').replace(' ', '_').lower()
+    cfg['service_name'] = service_name
+
+    print()
+    print("  CLI-Agent (ENTER = Standardwert übernehmen):")
+    print()
+
+    default = cfg.get('cli_command', '~/.npm-global/bin/claude')
+    val = input(f"  CLI Befehl [{default}]: ").strip()
+    cfg['cli_command'] = val or default
+
+    default = cfg.get('cli_working_dir', '~')
+    val = input(f"  Arbeitsverzeichnis [{default}]: ").strip()
+    cfg['cli_working_dir'] = val or default
+
+    cfg.setdefault('cli_prompt_param',             '-p')
+    cfg.setdefault('cli_system_prompt_param',      '--system-prompt')
+    cfg.setdefault('cli_session_id_param',         '--resume')
+    cfg.setdefault('cli_session_id_output_field',  'session_id')
+    cfg.setdefault('cli_answer_output_field',      'result')
+    cfg.setdefault('cli_timeout',                  600)
+    cfg.setdefault('cli_extra_params',             '--output-format json --dangerously-skip-permissions')
+    cfg.setdefault('cli_file_param',               '')
+    cfg.setdefault('cli_env',                      {})
+    cfg.setdefault('lang',                         'DE')
+
+    print()
+    print("  Telegram Bot-Konfiguration:")
+    print()
+
+    default = cfg.get('telegram_bot_token', '')
+    while True:
+        hint = f'bestehend: ...{default[-6:]}' if default else 'erforderlich'
+        val = input(f"  Bot-Token von @BotFather [{hint}]: ").strip()
+        token = val or default
+        if token:
+            break
+        print("  ⚠ Bot-Token ist erforderlich.")
+    cfg['telegram_bot_token'] = token
+
+    default = cfg.get('telegram_chat_id', '')
+    while True:
+        hint = default if default else 'erforderlich — Tipp: @userinfobot fragen'
+        val = input(f"  Chat-ID (deine Telegram User-ID) [{hint}]: ").strip()
+        chat_id = val or default
+        if chat_id:
+            break
+        print("  ⚠ Chat-ID ist erforderlich.")
+    cfg['telegram_chat_id'] = chat_id
+
+    print()
+    current_sp = cfg.get('telegram_system_prompt', DEFAULT_TELEGRAM_SYSTEM_PROMPT)
+    preview = current_sp[:80].replace('\n', ' ')
+    print(f"  System-Prompt (ENTER = aktuellen Wert behalten):")
+    print(f"  Aktuell: {preview}...")
+    val = input("  Neuer System-Prompt (oder ENTER): ").strip()
+    cfg['telegram_system_prompt'] = val if val else current_sp
+
+    cfg['telegram_only'] = True
+
+    save_config(cfg)
+    print()
+    print("  ✓ config.json gespeichert (Berechtigungen: 600).")
+
+    print()
+    print("=" * 60)
+    print("  Systemd User-Service einrichten")
+    print("=" * 60)
+    print()
+    print(f"  Service-Name: {service_name}")
+    print()
+    ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
+    if ans != 'n':
+        install_service(Path(__file__).parent, service_name)
+        try:
+            subprocess.run(
+                ['loginctl', 'enable-linger', os.environ.get('USER', '')],
+                check=True, capture_output=True,
+            )
+            print('  ✓ loginctl linger aktiviert (Service startet ohne Login)')
+        except Exception:
+            print('  Hinweis: loginctl enable-linger manuell ausführen für Auto-Start')
+
+    print()
+    print("=" * 60)
+    print("  Setup abgeschlossen!")
+    print("=" * 60)
+    print()
+    print(f"  Logs:    journalctl --user -u {service_name} -f")
+    print(f"  Status:  systemctl --user status {service_name}")
+    print(f"  Stopp:   systemctl --user stop {service_name}")
+    print()
+    sys.exit(0)
+
+
 def main():
+    # ── Telegram-Only Setup ───────────────────────────────────────────────────
+    if '--telegram-only' in sys.argv:
+        cmd_telegram_only()
+
     # ── Nicht-interaktive Befehle (KI-geeignet) ──────────────────────────────
     if '--get-token' in sys.argv:
         cmd_get_token()
