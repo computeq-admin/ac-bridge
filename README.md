@@ -1,6 +1,6 @@
 # AC Bridge — Agent Connect
 
-Connects your local AI agent CLI to the **Agent Connect** platform — usable via Alexa skill, iOS/Siri Shortcuts, and Telegram.
+Connects your local AI agent CLI to the **Agent Connect** platform — usable via the **Agent Talk iOS app**, Alexa skill, iOS/Siri Shortcuts, and Telegram.
 
 The bridge runs as a systemd user service, listens for MQTT wakeup signals, calls your local CLI agent, and returns the answer to the server.
 
@@ -12,6 +12,7 @@ The bridge runs as a systemd user service, listens for MQTT wakeup signals, call
 - `python3-venv` (`sudo apt install python3-venv`)
 - A local AI agent with a CLI interface (e.g. Claude CLI, OpenClaw, Aider, Goose …)
 - For full setup: an account at https://agent-connect.computeq.de
+- For iOS App setup: the **Agent Talk** app on your iPhone
 - For Telegram-only: a Telegram bot token (from [@BotFather](https://t.me/BotFather)) and your Telegram user ID
 
 ## Installation
@@ -63,39 +64,43 @@ Guides you through all steps interactively.
 
 Designed so an AI agent can set up the bridge on behalf of the user:
 
-**Step 1 — Generate Token-A:**
+**Step 1 — Generate Token-A and display QR code:**
 ```bash
 python3 setup.py --get-token
 ```
-Output: `Token-A: <64-char hex token>`
+Output: `Token-A: <64-char hex token>` plus a QR code rendered in the terminal.
 
-The AI should show this token to the user and ask them to open
-https://agent-connect.computeq.de, go to "Set up connection",
-enter the Token-A, and click "Request OTT".
+The user can either:
+- **Scan the QR code** with the **Agent Talk iOS app** (Config tab → "Scan Token-A") — the app then displays a 6-digit OTT automatically, or
+- Open https://agent-connect.computeq.de, go to "Set up connection", enter the Token-A manually, and receive the OTT there.
 
-**Step 2 — Redeem the OTT the user received:**
+**Step 2 — Redeem the 6-digit OTT:**
 ```bash
-python3 setup.py --redeem-ott <OTT>
+python3 setup.py --redeem-ott <6-digit OTT>
 ```
 This contacts the server, saves all credentials to `config.json`,
 installs the systemd user service, and starts the bridge.
+
+The OTT is valid for **10 minutes** and becomes invalid after the first use (or first failed attempt).
 
 Optional flag: `--no-service` skips service installation.
 
 **Step 3 — Configure the CLI agent:**
 
-Open https://agent-connect.computeq.de and go to "Configure Bridge".
-Use the preset buttons (e.g. "Claude CLI Defaults") to fill in the parameters,
-then click "Send config". The bridge receives the config via MQTT automatically.
+Use the **Agent Talk iOS app** (Config tab → Agent Configuration) or open
+https://agent-connect.computeq.de and go to "Configure Bridge".
+Use the preset buttons (e.g. "Claude Defaults") to fill in the parameters.
+The bridge receives the updated config via MQTT automatically.
 
 ### AI agent instructions (copy-paste for your AI)
 
-> Help me set up the AC Bridge:
-> 1. Clone https://github.com/computeq-admin/ac-bridge.git and run `./install.sh`
-> 2. Run `python3 setup.py --get-token` and show me the Token-A
-> 3. I will open https://agent-connect.computeq.de and get an OTT — tell me when you're ready
-> 4. Run `python3 setup.py --redeem-ott <OTT I provide>`
-> 5. The bridge is now running. I'll configure the CLI agent via the web portal.
+> Please install the AC Bridge on this machine:
+> 1. `git clone https://github.com/computeq-admin/ac-bridge.git`
+> 2. `cd ac-bridge && ./install.sh`
+> 3. `python3 setup.py --get-token`
+>
+> Show me the QR code from the terminal. I will scan it with the Agent Talk iOS app and give you a 6-digit OTT.
+> Then run: `python3 setup.py --redeem-ott <OTT>`
 
 ## CLI commands reference
 
@@ -140,10 +145,10 @@ Created automatically by setup. Credentials are protected (chmod 600).
 
 ## How it works
 
-### Full mode (Alexa / Siri / Telegram via Agent Connect)
+### Full mode (Agent Talk iOS app / Alexa / Siri / Telegram via Agent Connect)
 
 ```
-Alexa / Siri / Telegram
+Agent Talk iOS app / Alexa / Siri / Telegram
         ↓
    AC Server
         ↓ MQTT wakeup
@@ -155,7 +160,7 @@ Alexa / Siri / Telegram
         ↓
    return answer to server
         ↓
-   Alexa reads answer / Telegram reply
+   iOS app shows answer / Alexa reads / Telegram reply
 ```
 
 ### Telegram-only mode
