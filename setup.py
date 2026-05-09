@@ -53,8 +53,8 @@ def show_qr(text):
         print()
         qr.print_ascii(invert=True)
         print()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  (QR-Fehler: {e})")
 
 
 def load_or_create_config():
