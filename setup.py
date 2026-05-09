@@ -39,16 +39,17 @@ def generate_token_a():
 
 
 def show_qr(text):
-    """Zeigt text als QR-Code im Terminal (benötigt qrencode)."""
-    import shutil
-    if shutil.which('qrencode'):
+    """Zeigt text als QR-Code im Terminal (via qrcode aus der venv)."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(text)
+        qr.make(fit=True)
         print()
-        try:
-            subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-o', '-', text], check=True)
-        except Exception:
-            pass
-    else:
-        print("  (Tipp: sudo apt install qrencode für QR-Anzeige im Terminal)")
+        qr.print_ascii(invert=True)
+        print()
+    except Exception:
+        pass
 
 
 def load_or_create_config():
