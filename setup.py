@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import sys, os
+import sys
 from pathlib import Path
-_venv_py = Path(__file__).parent / 'venv' / 'bin' / 'python3'
-if _venv_py.exists() and Path(sys.executable).resolve() != _venv_py.resolve():
-    os.execv(str(_venv_py), [str(_venv_py)] + sys.argv)
+_venv_site = next((Path(__file__).parent / 'venv').glob('lib/python*/site-packages'), None)
+if _venv_site:
+    sys.path.insert(0, str(_venv_site))
 """
 AC Bridge Setup
 Führt die Ersteinrichtung der Bridge durch:
