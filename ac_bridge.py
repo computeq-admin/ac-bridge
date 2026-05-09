@@ -417,6 +417,7 @@ def process_wakeup(cfg):
     job_id        = job.get('job_id')
     system_prompt = job.get('system_prompt', '')
     reset         = job.get('reset_history', True)
+    image_data_b64 = job.get('image_data', '')
 
     if not prompt or not job_id:
         log.warning('Job has no prompt or id, skipping.')
@@ -426,7 +427,30 @@ def process_wakeup(cfg):
         reset_session()
     log.info(f'Processing job #{job_id}: "{prompt[:60]}..."')
 
-    answer = call_agent_cli(cfg, prompt, system_prompt)
+    # Bild dekodieren und als Temp-Datei ablegen
+    downloaded_files = []
+    if image_data_b64:
+        import base64 as _base64
+        try:
+            image_bytes = _base64.b64decode(image_data_b64)
+            base_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+            dest_dir = Path(base_dir) / 'session_files'
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f'ios_img_{job_id}.jpg'
+            dest.write_bytes(image_bytes)
+            downloaded_files.append(str(dest))
+            log.info(f'Image decoded for job #{job_id}: {dest} ({len(image_bytes)} bytes)')
+        except Exception as e:
+            log.error(f'Image decode failed for job #{job_id}: {e}')
+
+    answer = call_agent_cli(cfg, prompt, system_prompt, files=downloaded_files or None)
+
+    # Temp-Datei aufräumen
+    for fp in downloaded_files:
+        try:
+            Path(fp).unlink(missing_ok=True)
+        except Exception:
+            pass
 
     if answer:
         put_answer(cfg, job_id, answer)
