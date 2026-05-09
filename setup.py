@@ -38,6 +38,19 @@ def generate_token_a():
     return secrets.token_hex(32)  # 64 Zeichen hex
 
 
+def show_qr(text):
+    """Zeigt text als QR-Code im Terminal (benötigt qrencode)."""
+    import shutil
+    if shutil.which('qrencode'):
+        print()
+        try:
+            subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-o', '-', text], check=True)
+        except Exception:
+            pass
+    else:
+        print("  (Tipp: sudo apt install qrencode für QR-Anzeige im Terminal)")
+
+
 def load_or_create_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -187,6 +200,7 @@ def cmd_get_token():
     cfg.pop('token_b', None)
     save_config(cfg)
     print(f"Token-A: {token_a}")
+    show_qr(token_a)
     sys.exit(0)
 
 
@@ -453,11 +467,13 @@ def main():
     print("  Dein Token-A (Bridge-Identifikation):")
     print()
     print(f"  >>> {token_a} <<<")
+    show_qr(token_a)
     print()
-    print("  Trage diesen Token jetzt in dein Webportal ein:")
+    print("  Scanne den QR-Code mit der Agent-Talk iOS App (Konfiguration → Bridge)")
+    print("  oder trage den Token manuell ins Webportal ein:")
     print(f"  {DEFAULT_SERVER}/index.php")
     print()
-    print("  Das Portal gibt dir einen One-Time-Token (OTT) zurück.")
+    print("  Du erhältst einen One-Time-Token (OTT) zurück.")
     print()
     input("  Drücke ENTER wenn du den OTT erhalten hast...")
 

@@ -11,6 +11,12 @@ echo "  Installation"
 echo "========================================"
 echo ""
 
+# qrencode installieren (für QR-Code-Anzeige im Terminal)
+if ! command -v qrencode &> /dev/null; then
+    echo "→ Installiere qrencode..."
+    sudo apt-get install -y qrencode -q 2>/dev/null || true
+fi
+
 # Python3 vorhanden?
 if ! command -v python3 &> /dev/null; then
     echo "❌ python3 nicht gefunden. Bitte installieren:"
