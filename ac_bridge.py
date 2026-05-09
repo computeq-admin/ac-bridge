@@ -473,6 +473,7 @@ def on_connect(client, userdata, flags, rc):
         topic = f"ac/{cfg['token_a']}"
         client.subscribe(topic, qos=1)
         log.info(f'Connected to MQTT broker, subscribed to: {topic}')
+        threading.Thread(target=send_pong, args=(cfg,), daemon=True).start()
     else:
         log.error(f'MQTT connect failed, rc={rc}')
 
