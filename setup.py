@@ -188,12 +188,14 @@ def cmd_get_token():
     if cfg.get('token_b'):
         print('INFO: Bridge ist bereits vollständig eingerichtet.')
         print(f"Token-A: {cfg['token_a']}")
+        show_qr(cfg['token_a'])
         print('Um neu einzurichten: python3 setup.py --setup')
         sys.exit(0)
 
     if cfg.get('token_a'):
         print('INFO: Setup läuft bereits (Token-A vorhanden, OTT noch nicht eingelöst).')
         print(f"Token-A: {cfg['token_a']}")
+        show_qr(cfg['token_a'])
         sys.exit(0)
 
     token_a = generate_token_a()
