@@ -320,7 +320,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             prompt = f'{system_prompt}\n\n{prompt}' if prompt else system_prompt
 
     for arg in shlex.split(cfg.get('cli_extra_params', '')):
-        cmd.append(arg)
+        cmd.append(os.path.expanduser(arg))
 
     # Dateianhänge einbauen
     file_param = cfg.get('cli_file_param', '')
