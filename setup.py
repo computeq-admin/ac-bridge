@@ -75,6 +75,28 @@ def sanitize_service_name(email):
     return 'ac_bridge-' + email.replace('@', '-')
 
 
+def remove_existing_services(service_name):
+    """Stoppt und deaktiviert den angegebenen ac_bridge systemd User-Service, falls er existiert."""
+    systemd_dir = Path.home() / '.config' / 'systemd' / 'user'
+    service_file = systemd_dir / f'{service_name}.service'
+    if not service_file.exists():
+        return
+
+    print(f"  Entferne bestehenden Service '{service_name}'...")
+    try:
+        subprocess.run(['systemctl', '--user', 'stop',    service_name], capture_output=True)
+        subprocess.run(['systemctl', '--user', 'disable', service_name], capture_output=True)
+        print(f"  ✓ '{service_name}' gestoppt und deaktiviert")
+    except FileNotFoundError:
+        pass  # systemctl nicht verfügbar, ignorieren
+
+    try:
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True, capture_output=True)
+        print("  ✓ systemd daemon-reload")
+    except Exception:
+        pass
+
+
 def install_service(install_dir, service_name):
     """Installiert ac_bridge als systemd User-Service mit gegebenem Service-Namen."""
     service_template = Path(__file__).parent / 'ac_bridge.service'
@@ -276,6 +298,7 @@ def cmd_redeem_ott(ott):
     print(f'✓ config.json gespeichert (Berechtigungen: 600)')
 
     if '--no-service' not in sys.argv:
+        remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         try:
             subprocess.run(
@@ -383,6 +406,7 @@ def cmd_telegram_only():
     print()
     ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
     if ans != 'n':
+        remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         try:
             subprocess.run(
@@ -572,6 +596,7 @@ def main():
     print()
     ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
     if ans != 'n':
+        remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         print()
         print("  Tipp: Damit der Service auch ohne Login startet:")
