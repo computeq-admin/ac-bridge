@@ -680,7 +680,7 @@ def telegram_poll_loop(cfg):
                 telegram_send(token, chat_id, '⚠️ Bridge nicht konfiguriert. Bitte CLI-Konfiguration im Backend setzen.')
                 continue
 
-            system_prompt = cfg.get('telegram_system_prompt', '')
+            system_prompt = cfg.get('system_prompt_chat', '') or cfg.get('telegram_system_prompt', '')
             telegram_send_typing(token, chat_id)
 
             answer = call_agent_cli(cfg, text, system_prompt, files=downloaded_files or None)
