@@ -224,3 +224,39 @@ systemctl --user restart ac_bridge-user-example.com
 ```
 
 For Telegram-only, just re-run `python3 setup.py --telegram-only` — existing values are shown as defaults.
+
+## Uninstall
+
+### 1. Stop and remove the systemd service
+
+```bash
+# Stop the running service
+systemctl --user stop $(grep service_name config.json | cut -d'"' -f4)
+
+# Disable autostart
+systemctl --user disable $(grep service_name config.json | cut -d'"' -f4)
+
+# Remove the service file
+rm -f ~/.config/systemd/user/$(grep service_name config.json | cut -d'"' -f4).service
+
+# Reload systemd
+systemctl --user daemon-reload
+```
+
+If you no longer have `config.json`, replace the `$(...)` subshell with the actual service name (e.g. `ac_bridge-user-example.com`):
+
+```bash
+systemctl --user stop ac_bridge-user-example.com
+systemctl --user disable ac_bridge-user-example.com
+rm -f ~/.config/systemd/user/ac_bridge-user-example.com.service
+systemctl --user daemon-reload
+```
+
+### 2. Delete the local installation
+
+```bash
+# Remove the cloned repository and all configuration
+rm -rf ~/ac-bridge
+```
+
+After this, the bridge is fully removed from your system.
