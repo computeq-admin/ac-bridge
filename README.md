@@ -1,6 +1,6 @@
 # AC Bridge — Agent Connect
 
-Connects your local AI agent CLI to the **Agent Connect** platform — usable via the **Agent Talk iOS app**, Alexa skill, iOS/Siri Shortcuts, and Telegram.
+Connects your local AI agent CLI to the **Agent Connect** platform — usable via the **Agent Talk iOS app** and Telegram.
 
 The bridge runs as a systemd user service, listens for MQTT wakeup signals, calls your local CLI agent, and returns the answer to the server.
 
