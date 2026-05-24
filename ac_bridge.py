@@ -257,7 +257,8 @@ def json_get(data, path):
 # ─────────────────────────────────────────────
 # Session management
 # ─────────────────────────────────────────────
-_current_session_id = None
+_current_session_id  = None
+_openclaw_agent_id   = None   # cached after first successful 'openclaw agents list'
 
 
 def reset_session():
@@ -270,6 +271,38 @@ def store_session_id(session_id):
     global _current_session_id
     _current_session_id = session_id
     log.info(f'Session ID stored: {session_id}')
+
+
+# ─────────────────────────────────────────────
+# Openclaw agent auto-discovery
+# ─────────────────────────────────────────────
+def discover_openclaw_agent_id(cli_binary, cwd):
+    """Run 'openclaw agents list --json' once and cache the first agent's ID."""
+    global _openclaw_agent_id
+    if _openclaw_agent_id:
+        return _openclaw_agent_id
+    log.info('Auto-discovering openclaw agent ID ...')
+    try:
+        result = subprocess.run(
+            [cli_binary, 'agents', 'list', '--json'],
+            capture_output=True, text=True, timeout=15, cwd=cwd
+        )
+        output = result.stdout.strip()
+        if result.returncode == 0 and output:
+            data = json.loads(output)
+            agents = data if isinstance(data, list) else data.get('agents', [])
+            if agents:
+                agent = agents[0]
+                agent_id = (agent.get('id') or agent.get('agentId')
+                            or agent.get('agent_id') or agent.get('_id'))
+                if agent_id:
+                    _openclaw_agent_id = str(agent_id)
+                    log.info(f'Openclaw agent auto-discovered: {_openclaw_agent_id} ({agent.get("name", "")})')
+                    return _openclaw_agent_id
+        log.warning(f'openclaw agents list returned no usable ID (rc={result.returncode}): {output[:200]}')
+    except Exception as e:
+        log.error(f'Failed to auto-discover openclaw agent ID: {e}')
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -311,6 +344,16 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             log.info(f'New session (generated ID): {new_id}')
         else:
             log.info('Starting new session (no resume)')
+
+    # Openclaw requires --agent <id> when starting a new session so it knows
+    # which configured agent to invoke. Auto-discover via 'openclaw agents list'.
+    if 'openclaw' in os.path.basename(cmd[0]) and not _current_session_id:
+        _cwd = os.path.expanduser(cfg.get('cli_working_dir') or '') or None
+        agent_id = discover_openclaw_agent_id(cmd[0], _cwd)
+        if agent_id:
+            cmd += ['--agent', agent_id]
+        else:
+            log.warning('Could not auto-discover openclaw agent ID — add "--agent <id>" to cli_extra_params manually.')
 
     sp_param = cfg.get('cli_system_prompt_param', '')
     if system_prompt:
