@@ -315,9 +315,13 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
     sp_param = cfg.get('cli_system_prompt_param', '')
     if system_prompt:
         if sp_param:
+            log.info(f'Passing system prompt via param "{sp_param}" ({len(system_prompt)} chars): "{system_prompt[:120]}"')
             cmd += [sp_param, system_prompt]
         else:
+            log.info(f'No sp_param configured — prepending system prompt to prompt ({len(system_prompt)} chars): "{system_prompt[:120]}"')
             prompt = f'{system_prompt}\n\n{prompt}' if prompt else system_prompt
+    else:
+        log.info('No system prompt passed to agent CLI.')
 
     for arg in shlex.split(cfg.get('cli_extra_params', '')):
         cmd.append(os.path.expanduser(arg))
@@ -426,6 +430,10 @@ def process_wakeup(cfg):
     if reset:
         reset_session()
     log.info(f'Processing job #{job_id}: "{prompt[:60]}..."')
+    if system_prompt:
+        log.info(f'System prompt received ({len(system_prompt)} chars): "{system_prompt[:120]}"')
+    else:
+        log.info('System prompt: (none received from server)')
 
     # Bild dekodieren und als Temp-Datei ablegen
     downloaded_files = []
