@@ -28,6 +28,26 @@ cd ac-bridge
 
 ## Setup
 
+### Getting Telegram credentials
+
+You need two things: a **bot token** and your **chat ID**.
+
+**Bot token** — create a bot via [@BotFather](https://t.me/BotFather):
+
+1. Open Telegram and start a chat with [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`
+3. Choose a display name (e.g. `My AI Agent`)
+4. Choose a username ending in `bot` (e.g. `myaiagent_bot`)
+5. BotFather replies with a token like `123456789:ABCdef...` — copy it
+
+**Chat ID** — your personal Telegram user ID:
+
+1. Start a chat with [@userinfobot](https://t.me/userinfobot)
+2. Send any message (e.g. `/start`)
+3. It replies with your user ID (a number like `987654321`) — copy it
+
+> The chat ID is a permanent number tied to your Telegram account, not the bot.
+
 ### Option A — Telegram-only (no Agent Connect account required)
 
 If you only want to chat with your local AI agent via Telegram:
@@ -40,8 +60,8 @@ This walks you through an interactive setup that asks for:
 
 - Your username (used for the service name)
 - CLI agent command and working directory
-- Telegram bot token (get one from [@BotFather](https://t.me/BotFather))
-- Telegram chat ID (your user ID — ask [@userinfobot](https://t.me/userinfobot))
+- Telegram bot token (from [@BotFather](https://t.me/BotFather) — see above)
+- Telegram chat ID (your user ID — see above)
 - Optional: custom system prompt
 
 All Claude CLI parameters are pre-filled with sensible defaults
@@ -51,6 +71,26 @@ continuity, etc.). The service is installed and started at the end.
 The service name will be `ac_bridge_tg-<username>`.
 
 In Telegram you can start a new session at any time with the `/new` command.
+
+### Option A2 — Add Telegram to an existing full setup
+
+If the bridge is already connected to Agent Connect and you want to additionally
+receive answers and chat via Telegram:
+
+```bash
+python3 setup.py --set-telegram --bot-token <TOKEN> --chat-id <ID>
+```
+
+This saves the credentials to `config.json` and restarts the service immediately.
+No interactive input needed — the AI agent can run this command directly.
+
+**AI agent instructions (copy-paste for your AI):**
+
+> Please configure Telegram for the AC Bridge:
+> ```
+> python3 ~/ac-bridge/setup.py --set-telegram --bot-token <TOKEN> --chat-id <ID>
+> ```
+> Replace `<TOKEN>` with the bot token from @BotFather and `<ID>` with the chat ID from @userinfobot.
 
 ### Option B — Full setup (interactive, with Agent Connect)
 
@@ -111,6 +151,7 @@ The bridge receives the updated config via MQTT automatically.
 | `python3 setup.py --get-token` | Show / generate Token-A (non-interactive) |
 | `python3 setup.py --redeem-ott <OTT>` | Redeem OTT and complete setup (non-interactive) |
 | `python3 setup.py --redeem-ott <OTT> --no-service` | Same, skip systemd service install |
+| `python3 setup.py --set-telegram --bot-token <TOKEN> --chat-id <ID>` | Set Telegram credentials and restart service (non-interactive) |
 | `python3 setup.py --config` | Reconfigure CLI agent locally (interactive) |
 | `./start.sh` | Start bridge manually (no service) |
 

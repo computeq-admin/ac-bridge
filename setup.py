@@ -316,6 +316,58 @@ def cmd_redeem_ott(ott):
     sys.exit(0)
 
 
+def cmd_set_telegram():
+    """--set-telegram: Telegram Bot-Token und Chat-ID setzen (nicht-interaktiv, KI-geeignet)."""
+    args = sys.argv
+
+    bot_token = None
+    chat_id   = None
+
+    if '--bot-token' in args:
+        idx = args.index('--bot-token')
+        if idx + 1 < len(args):
+            bot_token = args[idx + 1].strip()
+
+    if '--chat-id' in args:
+        idx = args.index('--chat-id')
+        if idx + 1 < len(args):
+            chat_id = args[idx + 1].strip()
+
+    if not bot_token or not chat_id:
+        print('Fehler: --bot-token und --chat-id sind erforderlich.')
+        print('Verwendung: python3 setup.py --set-telegram --bot-token <TOKEN> --chat-id <ID>')
+        sys.exit(1)
+
+    cfg = load_or_create_config()
+    cfg['telegram_bot_token'] = bot_token
+    cfg['telegram_chat_id']   = chat_id
+    save_config(cfg)
+
+    print(f'✓ telegram_bot_token gesetzt (endet auf ...{bot_token[-6:]})')
+    print(f'✓ telegram_chat_id gesetzt: {chat_id}')
+
+    service_name = cfg.get('service_name', '')
+    if service_name:
+        try:
+            result = subprocess.run(
+                ['systemctl', '--user', 'is-active', service_name],
+                capture_output=True, text=True,
+            )
+            if result.stdout.strip() == 'active':
+                subprocess.run(['systemctl', '--user', 'restart', service_name], check=True)
+                print(f'✓ Service "{service_name}" neu gestartet')
+            else:
+                print(f'  Service "{service_name}" läuft nicht — kein Neustart.')
+        except FileNotFoundError:
+            print('  systemctl nicht verfügbar — kein automatischer Neustart.')
+        except subprocess.CalledProcessError as e:
+            print(f'  ⚠ Neustart fehlgeschlagen: {e}')
+    else:
+        print('  Kein Service-Name in config.json — kein automatischer Neustart.')
+
+    sys.exit(0)
+
+
 def cmd_telegram_only():
     """--telegram-only: Richtet die Bridge ohne MQTT nur für Telegram ein."""
     cfg = load_or_create_config()
@@ -435,6 +487,9 @@ def main():
         cmd_telegram_only()
 
     # ── Nicht-interaktive Befehle (KI-geeignet) ──────────────────────────────
+    if '--set-telegram' in sys.argv:
+        cmd_set_telegram()
+
     if '--get-token' in sys.argv:
         cmd_get_token()
 
