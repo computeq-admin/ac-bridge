@@ -58,6 +58,17 @@ ALLOWED_CLI_EXECUTABLES = {
     'claude', 'openclaw', 'copilot', 'gemini', 'aider', 'interpreter', 'goose',
 }
 
+# ─────────────────────────────────────────────
+# Self-Update (öffentliches Repo, HTTPS read-only)
+# ─────────────────────────────────────────────
+REPO_DIR         = Path(__file__).resolve().parent
+GITHUB_FETCH_URL = 'https://github.com/computeq-admin/ac-bridge.git'
+GIT_BRANCH       = 'main'
+UPDATE_CHECK_TTL = 3600  # Sekunden: Remote-Versionscheck höchstens stündlich
+
+# Gecachter Update-Status (wird im Heartbeat an den Server gemeldet)
+_update_status = {'commit': '', 'available': False, 'ts': 0.0}
+
 def load_config():
     if not CONFIG_FILE.exists():
         log.error('config.json not found. Run setup first.')
@@ -180,12 +191,110 @@ def get_job(cfg):
     return None
 
 
+def _git_local_commit():
+    """Vollständiger lokaler Commit-Hash oder '' bei Fehler."""
+    try:
+        out = subprocess.run(
+            ['git', '-C', str(REPO_DIR), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ''
+    except Exception as e:
+        log.error(f'git rev-parse failed: {e}')
+        return ''
+
+
+def _git_remote_commit():
+    """Vollständiger Remote-Commit-Hash von origin/main via HTTPS oder '' bei Fehler."""
+    try:
+        out = subprocess.run(
+            ['git', 'ls-remote', GITHUB_FETCH_URL, f'refs/heads/{GIT_BRANCH}'],
+            capture_output=True, text=True, timeout=20,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.split()[0].strip()
+    except Exception as e:
+        log.error(f'git ls-remote failed: {e}')
+    return ''
+
+
+def refresh_update_status(force=False):
+    """Vergleicht lokalen mit Remote-Commit, max. einmal pro UPDATE_CHECK_TTL.
+
+    Aktualisiert den gecachten _update_status (commit kurz + available). Vergleich
+    erfolgt über die vollen Hashes, gemeldet/angezeigt wird der gekürzte Commit."""
+    now = time.time()
+    if not force and (now - _update_status['ts'] < UPDATE_CHECK_TTL):
+        return
+    local  = _git_local_commit()
+    remote = _git_remote_commit()
+    if local:
+        _update_status['commit'] = local[:7]
+        # Nur als veraltet melden, wenn der Remote-Check erfolgreich war.
+        _update_status['available'] = bool(remote and local != remote)
+        _update_status['ts'] = now
+        log.info(f'Update check: local={local[:7]} remote={remote[:7] or "?"} '
+                 f'available={_update_status["available"]}')
+
+
+def perform_self_update(cfg):
+    """git fetch + hard reset auf origin/main (HTTPS), pip install, Service-Neustart.
+
+    Wird via MQTT action=update ausgelöst. config.json ist .gitignored, daher ist
+    `reset --hard` gefahrlos und vermeidet Merge-Konflikte."""
+    log.info('Self-update requested')
+    try:
+        subprocess.run(
+            ['git', '-C', str(REPO_DIR), 'fetch', GITHUB_FETCH_URL, GIT_BRANCH],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        subprocess.run(
+            ['git', '-C', str(REPO_DIR), 'reset', '--hard', 'FETCH_HEAD'],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        log.info(f'Code updated to {_git_local_commit()[:7]}')
+    except Exception as e:
+        log.error(f'Self-update git step failed: {e}')
+        return False
+
+    # Abhängigkeiten aktualisieren (best effort)
+    venv_pip = REPO_DIR / 'venv' / 'bin' / 'pip'
+    req      = REPO_DIR / 'requirements.txt'
+    if venv_pip.exists() and req.exists():
+        try:
+            subprocess.run(
+                [str(venv_pip), 'install', '-r', str(req)],
+                capture_output=True, text=True, timeout=180,
+            )
+        except Exception as e:
+            log.error(f'pip install after update failed: {e}')
+
+    # Neustart über systemd lädt den neuen Code (gleiches Muster wie update-config)
+    _update_status['ts'] = 0.0  # erzwingt frischen Check nach Neustart
+    service_name = cfg.get('service_name', '')
+    if service_name:
+        log.info(f'Restarting service after update: {service_name}')
+        try:
+            subprocess.run(['systemctl', '--user', 'restart', service_name], timeout=10)
+        except Exception as e:
+            log.error(f'Restart after update failed: {e}')
+    else:
+        log.warning('No service_name set; exiting so systemd restarts the process')
+        os._exit(0)
+    return True
+
+
 def send_pong(cfg):
     """Antwortet auf Server-Ping, rotiert Token-B"""
+    refresh_update_status()
     try:
         r = requests.post(
             cfg['server_url'] + '/ping.php',
-            json={'token_b': cfg['token_b']},
+            json={
+                'token_b':          cfg['token_b'],
+                'bridge_commit':    _update_status['commit'],
+                'update_available': _update_status['available'],
+            },
             timeout=10,
         )
         data = r.json()
@@ -548,6 +657,8 @@ def on_message(client, userdata, msg):
         send_pong(cfg)
     elif action == 'update-config':
         apply_config_update(cfg)
+    elif action == 'update':
+        perform_self_update(cfg)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
