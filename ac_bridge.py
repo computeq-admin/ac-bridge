@@ -16,7 +16,7 @@ Installation:
 Konfiguration: config.json im gleichen Verzeichnis
 """
 
-# update-test 2026-05-31: irrelevante Änderung, um den Self-Update-Flow zu prüfen
+# update-test 2026-05-31 #2: Self-Update-Flow erneut prüfen (mit Auto-Refresh der App-Anzeige)
 
 import json
 import logging
