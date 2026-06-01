@@ -35,12 +35,13 @@ import requests
 # ─────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────
+LOG_FILE = Path(__file__).resolve().parent / 'ac_bridge.log'
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('ac_bridge.log'),
+        logging.FileHandler(LOG_FILE),
     ]
 )
 log = logging.getLogger('ac_bridge')
@@ -284,6 +285,33 @@ def perform_self_update(cfg):
         log.warning('No service_name set; exiting so systemd restarts the process')
         os._exit(0)
     return True
+
+
+def send_bridge_log(cfg, max_lines=800):
+    """Liest die letzten max_lines Zeilen des Logs und schickt sie an den Server.
+
+    Wird via MQTT action=send-log ausgelöst (Support-Anfrage aus der App)."""
+    try:
+        with open(LOG_FILE, 'r', errors='replace') as f:
+            lines = f.readlines()
+        tail = ''.join(lines[-max_lines:])
+    except Exception as e:
+        log.error(f'send_bridge_log: reading log failed: {e}')
+        tail = f'(Logdatei konnte nicht gelesen werden: {e})'
+
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_log.php',
+            json={'token_b': cfg['token_b'], 'log': tail},
+            timeout=15,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        log.info(f'Bridge log sent ({len(tail)} bytes)')
+    except Exception as e:
+        log.error(f'send_bridge_log: post failed: {e}')
 
 
 def send_pong(cfg):
@@ -661,6 +689,8 @@ def on_message(client, userdata, msg):
         apply_config_update(cfg)
     elif action == 'update':
         perform_self_update(cfg)
+    elif action == 'send-log':
+        send_bridge_log(cfg)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
