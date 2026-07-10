@@ -345,16 +345,24 @@ def send_pong(cfg):
         log.warning(f'Unexpected ping response: {data}')
 
 
-def put_answer(cfg, job_id, answer):
-    """Schreibt Antwort zurück, rotiert Token-B"""
+def put_answer(cfg, job_id, answer, session_id=None):
+    """Schreibt Antwort zurück, rotiert Token-B.
+
+    session_id: die (neue oder fortgesetzte) Claude-Session-ID aus diesem Call, falls
+    vom Agenten geliefert. Wird nur mitgeschickt wenn vorhanden — put_answer.php lässt
+    die gespeicherte session_id sonst unangetastet.
+    """
+    payload = {
+        'token_b': cfg['token_b'],
+        'job_id':  job_id,
+        'answer':  answer,
+    }
+    if session_id:
+        payload['session_id'] = session_id
     try:
         r = requests.post(
             cfg['server_url'] + '/put_answer.php',
-            json={
-                'token_b': cfg['token_b'],
-                'job_id':  job_id,
-                'answer':  answer,
-            },
+            json=payload,
             timeout=10,
         )
         data = r.json()
@@ -447,32 +455,41 @@ def discover_openclaw_agent_id(cli_binary, cwd):
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
-def call_agent_cli(cfg, prompt, system_prompt='', files=None):
-    """Ruft den KI-Agenten als lokalen CLI-Prozess auf, gibt Antwort-Text zurück.
+def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
+    """Ruft den KI-Agenten als lokalen CLI-Prozess auf.
 
     Session-Handling:
-      - Kein _current_session_id → kein --resume, neuer Session-Start
-      - _current_session_id gesetzt → --resume <id> wird übergeben
-      - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert)
+      - session_id_override gesetzt (App will ein bestimmtes altes Gespräch fortsetzen):
+        hat Vorrang vor der RAM-gehaltenen _current_session_id für diesen einen Call.
+      - Sonst: kein _current_session_id → kein --resume, neuer Session-Start;
+               _current_session_id gesetzt → --resume <id> wird übergeben (Legacy-Verhalten
+               für Alexa/Siri/ältere App-Versionen, die keine session_id mitschicken).
+      - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert),
+        als neue _current_session_id übernehmen UND zurückgegeben (für put_answer).
 
     files: optionale Liste lokaler Dateipfade die an den Agenten übergeben werden.
       - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
       - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
+
+    Rückgabe: (answer, session_id) — answer ist None bei Fehler; session_id ist die aus
+    dem Output extrahierte ID oder None (kein Feld konfiguriert / nicht vorhanden).
     """
     if not cfg.get('cli_command'):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
-        return None
+        return None, None
 
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
 
     # Session-Handling
     session_param    = cfg.get('cli_session_id_param', '')
     session_id_field = cfg.get('cli_session_id_output_field', '')
+    resume_id        = session_id_override or _current_session_id
 
     if session_param:
-        if _current_session_id:
-            cmd += [session_param, _current_session_id]
-            log.info(f'Continuing session: {_current_session_id}')
+        if resume_id:
+            origin = ' (App-Fortsetzen)' if session_id_override else ''
+            cmd += [session_param, resume_id]
+            log.info(f'Continuing session: {resume_id}{origin}')
         elif not session_id_field:
             # Input-Modus (z.B. openclaw): Session-ID wird immer übergeben,
             # kommt nicht aus dem Output → neue UUID generieren
@@ -486,7 +503,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
 
     # Openclaw requires --agent <id> when starting a new session so it knows
     # which configured agent to invoke. Auto-discover via 'openclaw agents list'.
-    if 'openclaw' in os.path.basename(cmd[0]) and not _current_session_id:
+    if 'openclaw' in os.path.basename(cmd[0]) and not resume_id:
         _cwd = os.path.expanduser(cfg.get('cli_working_dir') or '') or None
         agent_id = discover_openclaw_agent_id(cmd[0], _cwd)
         if agent_id:
@@ -550,42 +567,44 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None):
             log.error(f'CMD:    {" ".join(cmd)}')
             log.error(f'STDERR: {result.stderr[:500]}')
             log.error(f'STDOUT: {result.stdout[:500]}')
-            return None
+            return None, None
 
         raw = result.stdout.strip()
         if not raw:
             log.error('CLI returned empty output')
-            return None
+            return None, None
 
         # JSON-Output parsen wenn session_id_field gesetzt ODER answer_field Dot-Notation enthält
         answer_field     = cfg.get('cli_answer_output_field', 'result')
         parse_json       = bool(session_id_field) or '.' in answer_field
+        extracted_sid    = None
         if parse_json:
             try:
                 data = json.loads(raw)
                 if session_id_field:
                     new_sid = json_get(data, session_id_field) or ''
                     if new_sid:
-                        store_session_id(str(new_sid))
+                        extracted_sid = str(new_sid)
+                        store_session_id(extracted_sid)
                 answer = (json_get(data, answer_field) or '').strip()
                 if not answer:
                     log.error(f'JSON output has no "{answer_field}" field: {raw[:200]}')
-                    return None
+                    return None, None
             except json.JSONDecodeError:
                 log.error(f'Expected JSON output but got: {raw[:200]}')
-                return None
+                return None, None
         else:
             answer = raw
 
         log.info(f'CLI answered ({len(answer)} chars)')
-        return answer
+        return answer, extracted_sid
 
     except subprocess.TimeoutExpired:
         log.error(f'CLI timed out after {timeout}s')
-        return None
+        return None, None
     except Exception as e:
         log.error(f'CLI call failed: {e}')
-        return None
+        return None, None
 
 
 # ─────────────────────────────────────────────
@@ -604,6 +623,10 @@ def process_wakeup(cfg):
     system_prompt = job.get('system_prompt', '')
     reset         = job.get('reset_history', True)
     image_data_b64 = job.get('image_data', '')
+    # App-gesteuertes Fortsetzen eines bestimmten (u.U. alten) Gesprächs: hat Vorrang
+    # vor der RAM-gehaltenen Session. Leer bei Legacy-Jobs (Alexa/Siri/alte App) oder
+    # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
+    job_session_id = job.get('session_id') or None
 
     if not prompt or not job_id:
         log.warning('Job has no prompt or id, skipping.')
@@ -633,7 +656,10 @@ def process_wakeup(cfg):
         except Exception as e:
             log.error(f'Image decode failed for job #{job_id}: {e}')
 
-    answer = call_agent_cli(cfg, prompt, system_prompt, files=downloaded_files or None)
+    answer, new_session_id = call_agent_cli(
+        cfg, prompt, system_prompt, files=downloaded_files or None,
+        session_id_override=job_session_id,
+    )
 
     # Temp-Datei aufräumen
     for fp in downloaded_files:
@@ -643,7 +669,7 @@ def process_wakeup(cfg):
             pass
 
     if answer:
-        put_answer(cfg, job_id, answer)
+        put_answer(cfg, job_id, answer, session_id=new_session_id)
     else:
         lang = cfg.get('lang', 'DE')
         err_msg = (
@@ -877,7 +903,7 @@ def telegram_poll_loop(cfg):
             system_prompt = cfg.get('system_prompt_chat', '') or cfg.get('telegram_system_prompt', '')
             telegram_send_typing(token, chat_id)
 
-            answer = call_agent_cli(cfg, text, system_prompt, files=downloaded_files or None)
+            answer, _ = call_agent_cli(cfg, text, system_prompt, files=downloaded_files or None)
 
             # Temp-Dateien aufräumen
             for fp in downloaded_files:
