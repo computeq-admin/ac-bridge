@@ -651,7 +651,10 @@ def process_wakeup(cfg):
             # OpenClaw's "~" default — not where the bridge should stash its files).
             dest_dir = REPO_DIR / 'session_files'
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / f'ios_img_{job_id}.jpg'
+            # Timestamped so repeated uploads for the same job (single ac_jobs row per
+            # device) don't overwrite each other; files are kept, not cleaned up below.
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            dest = dest_dir / f'ios_img_{job_id}_{timestamp}.jpg'
             dest.write_bytes(image_bytes)
             downloaded_files.append(str(dest))
             log.info(f'Image decoded for job #{job_id}: {dest} ({len(image_bytes)} bytes)')
@@ -662,13 +665,6 @@ def process_wakeup(cfg):
         cfg, prompt, system_prompt, files=downloaded_files or None,
         session_id_override=job_session_id,
     )
-
-    # Temp-Datei aufräumen
-    for fp in downloaded_files:
-        try:
-            Path(fp).unlink(missing_ok=True)
-        except Exception:
-            pass
 
     if answer:
         put_answer(cfg, job_id, answer, session_id=new_session_id)
