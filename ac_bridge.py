@@ -646,7 +646,7 @@ def process_wakeup(cfg):
         import base64 as _base64
         try:
             image_bytes = _base64.b64decode(image_data_b64)
-            base_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+            base_dir = os.path.expanduser(cfg.get('cli_working_dir') or '') or str(Path(__file__).parent)
             dest_dir = Path(base_dir) / 'session_files'
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / f'ios_img_{job_id}.jpg'
@@ -881,7 +881,7 @@ def telegram_poll_loop(cfg):
             if attachment_info:
                 kind, attachment = attachment_info
                 file_id  = attachment.get('file_id', '')
-                base_dir = cfg.get('cli_working_dir') or str(Path(__file__).parent)
+                base_dir = os.path.expanduser(cfg.get('cli_working_dir') or '') or str(Path(__file__).parent)
                 dest_dir = str(Path(base_dir) / 'session_files')
                 Path(dest_dir).mkdir(parents=True, exist_ok=True)
                 log.info(f'Telegram attachment: {kind} (file_id={file_id})')
