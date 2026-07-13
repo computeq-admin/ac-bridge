@@ -98,7 +98,8 @@ All Claude CLI parameters are pre-filled with sensible defaults
 (`--output-format json --dangerously-skip-permissions`, `--resume` for session
 continuity, etc.). The service is installed and started at the end.
 
-The service name will be `ac_bridge_tg-<username>`.
+The service name will be `ac_bridge_tg-<username>-<install-dir>` (the install
+directory is included so multiple installs for the same username don't collide).
 
 In Telegram you can start a new session at any time with the `/new` command.
 
@@ -239,9 +240,11 @@ journalctl --user -u <service-name> -f
 loginctl enable-linger $USER
 ```
 
-Service name conventions:
-- Full setup: `ac_bridge-<email>` (e.g. `ac_bridge-user-example.com`)
-- Telegram-only: `ac_bridge_tg-<username>` (e.g. `ac_bridge_tg-ingo`)
+Service name conventions (the install directory name is appended so multiple
+bridge instances for the same email/username — e.g. one for Claude, one for
+Openclaw — get distinct services instead of overwriting each other):
+- Full setup: `ac_bridge-<email>-<install-dir>` (e.g. `ac_bridge-user-example.com-ac-bridge`)
+- Telegram-only: `ac_bridge_tg-<username>-<install-dir>` (e.g. `ac_bridge_tg-ingo-ac-bridge`)
 
 ## Update
 
@@ -253,7 +256,7 @@ systemctl --user restart $(grep service_name config.json | cut -d'"' -f4)
 
 Or if you know the service name:
 ```bash
-systemctl --user restart ac_bridge-user-example.com
+systemctl --user restart ac_bridge-user-example.com-ac-bridge
 ```
 
 ## Re-setup (reset connection)
@@ -284,12 +287,12 @@ rm -f ~/.config/systemd/user/$(grep service_name config.json | cut -d'"' -f4).se
 systemctl --user daemon-reload
 ```
 
-If you no longer have `config.json`, replace the `$(...)` subshell with the actual service name (e.g. `ac_bridge-user-example.com`):
+If you no longer have `config.json`, replace the `$(...)` subshell with the actual service name (e.g. `ac_bridge-user-example.com-ac-bridge`):
 
 ```bash
-systemctl --user stop ac_bridge-user-example.com
-systemctl --user disable ac_bridge-user-example.com
-rm -f ~/.config/systemd/user/ac_bridge-user-example.com.service
+systemctl --user stop ac_bridge-user-example.com-ac-bridge
+systemctl --user disable ac_bridge-user-example.com-ac-bridge
+rm -f ~/.config/systemd/user/ac_bridge-user-example.com-ac-bridge.service
 systemctl --user daemon-reload
 ```
 

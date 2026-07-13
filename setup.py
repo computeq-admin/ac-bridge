@@ -21,6 +21,7 @@ Usage:
 
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -70,9 +71,23 @@ def save_config(cfg):
     os.chmod(CONFIG_FILE, 0o600)
 
 
+def _sanitize_identifier(text):
+    """Ersetzt alles außer Buchstaben/Ziffern/-/_ durch '-' (systemd-kompatibel)."""
+    return re.sub(r'[^A-Za-z0-9_-]+', '-', text).strip('-')
+
+
+def _install_dir_tag():
+    """Kurzes Kennzeichen für dieses Installationsverzeichnis. Sorgt dafür, dass
+    mehrere Bridge-Installationen unter derselben E-Mail (z.B. eine für Claude,
+    eine für Openclaw) unterschiedliche Service-Namen bekommen, statt sich beim
+    Setup gegenseitig zu deaktivieren (siehe remove_existing_services)."""
+    return _sanitize_identifier(Path(__file__).resolve().parent.name)
+
+
 def sanitize_service_name(email):
-    """Erzeugt einen systemd-kompatiblen Service-Namen aus einer E-Mail-Adresse."""
-    return 'ac_bridge-' + email.replace('@', '-')
+    """Erzeugt einen systemd-kompatiblen Service-Namen aus E-Mail-Adresse +
+    Installationsverzeichnis — eindeutig pro Bridge-Instanz, nicht nur pro Account."""
+    return 'ac_bridge-' + _sanitize_identifier(email) + '-' + _install_dir_tag()
 
 
 def remove_existing_services(service_name):
@@ -274,6 +289,7 @@ def cmd_redeem_ott(ott):
     cfg['mqtt_tls']      = data.get('mqtt_tls', False)
     cfg['server_url']    = data.get('server_url', DEFAULT_SERVER)
 
+    old_service_name    = cfg.get('service_name', '')
     user_email          = data.get('user_email', '')
     service_name        = sanitize_service_name(user_email) if user_email else 'ac_bridge'
     cfg['service_name'] = service_name
@@ -298,6 +314,10 @@ def cmd_redeem_ott(ott):
     print(f'✓ config.json gespeichert (Berechtigungen: 600)')
 
     if '--no-service' not in sys.argv:
+        # Bei erneutem Redeem im selben Verzeichnis (z.B. Re-Pairing) altes
+        # Service-Namensschema mit aufräumen, sonst bleibt eine verwaiste Unit stehen.
+        if old_service_name and old_service_name != service_name:
+            remove_existing_services(old_service_name)
         remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         try:
@@ -385,7 +405,8 @@ def cmd_telegram_only():
     val = input(f"  Benutzername [{default}]: ").strip()
     cfg['user'] = val or default
 
-    service_name = 'ac_bridge_tg-' + (cfg['user'] or 'default').replace(' ', '_').lower()
+    old_service_name = cfg.get('service_name', '')
+    service_name = 'ac_bridge_tg-' + _sanitize_identifier((cfg['user'] or 'default').lower()) + '-' + _install_dir_tag()
     cfg['service_name'] = service_name
 
     print()
@@ -458,6 +479,10 @@ def cmd_telegram_only():
     print()
     ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
     if ans != 'n':
+        # Bei erneutem Setup im selben Verzeichnis altes Service-Namensschema mit
+        # aufräumen, sonst bleibt eine verwaiste Unit stehen.
+        if old_service_name and old_service_name != service_name:
+            remove_existing_services(old_service_name)
         remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         try:
@@ -610,6 +635,7 @@ def main():
     cfg['mqtt_tls']      = data.get('mqtt_tls', False)
     cfg['server_url']    = data.get('server_url', DEFAULT_SERVER)
 
+    old_service_name     = cfg.get('service_name', '')
     user_email           = data.get('user_email', '')
     service_name         = sanitize_service_name(user_email) if user_email else 'ac_bridge'
     cfg['service_name']  = service_name
@@ -651,6 +677,10 @@ def main():
     print()
     ans = input("  Service jetzt einrichten und starten? (J/n): ").strip().lower()
     if ans != 'n':
+        # Bei erneutem Setup im selben Verzeichnis (z.B. Re-Pairing) altes
+        # Service-Namensschema mit aufräumen, sonst bleibt eine verwaiste Unit stehen.
+        if old_service_name and old_service_name != service_name:
+            remove_existing_services(old_service_name)
         remove_existing_services(service_name)
         install_service(Path(__file__).parent, service_name)
         print()
