@@ -679,6 +679,359 @@ def process_wakeup(cfg):
 
 
 # ─────────────────────────────────────────────
+# Conversation History (Verlauf-Tab)
+#
+# Statt den Gesprächsverlauf clientseitig zu spiegeln, liest die Bridge ihn bei
+# Bedarf direkt aus den Session-Dateien des jeweiligen Agenten:
+#   - Claude:   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+#   - Openclaw: ~/.openclaw/agents/<agent>/sessions/<session-id>.trajectory.jsonl
+# 'encoded-cwd' bzw. der Agent-Ordner werden aus derselben Konfiguration/
+# Discovery abgeleitet, die call_agent_cli() ohnehin schon verwendet — damit
+# passt die History garantiert zum tatsächlich aufgerufenen Agenten/Projekt.
+# ─────────────────────────────────────────────
+HISTORY_UPLOAD_MAX_CHARS = 500_000  # Schutz gegen Riesen-Payloads (analog send_bridge_log)
+
+
+def _iso_from_mtime(path):
+    import datetime
+    return datetime.datetime.utcfromtimestamp(path.stat().st_mtime).isoformat() + 'Z'
+
+
+def _effective_cwd(cfg):
+    """Das Arbeitsverzeichnis, in dem der Agent tatsächlich läuft — exakt wie in
+    call_agent_cli() ermittelt (dort mit cwd=None an subprocess.run übergeben,
+    was das eigene Arbeitsverzeichnis der Bridge bedeutet)."""
+    cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
+    return cwd or os.getcwd()
+
+
+def _cli_binary(cfg):
+    cmd = shlex.split(os.path.expanduser(cfg.get('cli_command', '') or ''))
+    return cmd[0] if cmd else ''
+
+
+# --- Claude ---
+
+def _claude_project_dir(cfg):
+    encoded = _effective_cwd(cfg).replace('/', '-')
+    return Path.home() / '.claude' / 'projects' / encoded
+
+
+def _claude_extract_text(message):
+    if not isinstance(message, dict):
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
+        return '\n'.join(p for p in parts if p).strip()
+    return ''
+
+
+def _claude_session_files(cfg):
+    d = _claude_project_dir(cfg)
+    if not d.is_dir():
+        return []
+    return sorted(d.glob('*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _read_claude_summary(path):
+    title = None
+    last_ts = None
+    msg_count = 0
+    first_user_text = None
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get('isSidechain'):
+                    continue  # Tool-/Sub-Agent-interne Nebenläufe, kein sichtbarer Chat-Turn
+                t = o.get('type')
+                if t == 'ai-title' and o.get('aiTitle'):
+                    title = o['aiTitle']
+                elif t in ('user', 'assistant'):
+                    text = _claude_extract_text(o.get('message') or {})
+                    if not text:
+                        continue
+                    msg_count += 1
+                    if o.get('timestamp'):
+                        last_ts = o['timestamp']
+                    if t == 'user' and first_user_text is None:
+                        first_user_text = text
+    except Exception as e:
+        log.error(f'claude history summary failed for {path}: {e}')
+        return None
+    if msg_count == 0:
+        return None
+    return {
+        'session_id':     path.stem,
+        'title':          title or (first_user_text or 'Gespräch')[:60],
+        'updated_at':     last_ts or _iso_from_mtime(path),
+        'message_count':  msg_count,
+    }
+
+
+def _read_claude_detail(path):
+    messages = []
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get('isSidechain'):
+                    continue
+                t = o.get('type')
+                if t not in ('user', 'assistant'):
+                    continue
+                text = _claude_extract_text(o.get('message') or {})
+                if not text:
+                    continue
+                messages.append({
+                    'role':      'user' if t == 'user' else 'agent',
+                    'content':   text,
+                    'timestamp': o.get('timestamp') or '',
+                })
+    except Exception as e:
+        log.error(f'claude history detail failed for {path}: {e}')
+        return None
+    return messages
+
+
+# --- Openclaw ---
+
+def _openclaw_agents_root():
+    return Path.home() / '.openclaw' / 'agents'
+
+
+def _openclaw_peek_agent_id(path):
+    """Liest nur die ersten Zeilen, um die 'session.started'-Zeile mit dem
+    agentId zu finden, ohne die ganze (potenziell große) Datei zu parsen."""
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for i, line in enumerate(f):
+                if i >= 5:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get('type') == 'session.started':
+                    return (o.get('data') or {}).get('agentId')
+    except Exception:
+        return None
+    return None
+
+
+def _openclaw_session_files(cfg, cli_binary):
+    """Alle Trajectory-Dateien, deren agentId zum per Discovery ermittelten
+    Agenten passt. Iteriert bewusst über ALLE Agent-Unterordner statt einen
+    bestimmten Ordnernamen anzunehmen — der Ordnername entspricht zwar in der
+    Praxis der Agent-ID, ist das aber nicht garantiert dokumentiert. Schlägt
+    die Discovery fehl (agent_id=None), werden alle Sessions ungefiltert
+    zurückgegeben (lieber zu viel zeigen als gar keine Historie)."""
+    root = _openclaw_agents_root()
+    if not root.is_dir():
+        return []
+    cwd = _effective_cwd(cfg)
+    agent_id = discover_openclaw_agent_id(cli_binary, cwd)
+    matches = []
+    for sessions_dir in root.glob('*/sessions'):
+        for path in sessions_dir.glob('*.trajectory.jsonl'):
+            if agent_id is not None:
+                file_agent_id = _openclaw_peek_agent_id(path)
+                if file_agent_id is not None and str(file_agent_id) != str(agent_id):
+                    continue
+            matches.append(path)
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches
+
+
+def _read_openclaw_summary(path):
+    session_id = None
+    last_ts = None
+    msg_count = 0
+    first_prompt = None
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if session_id is None:
+                    session_id = o.get('sessionId')
+                if o.get('ts'):
+                    last_ts = o['ts']
+                t = o.get('type')
+                if t == 'prompt.submitted':
+                    text = ((o.get('data') or {}).get('prompt') or '').strip()
+                    if text:
+                        msg_count += 1
+                        if first_prompt is None:
+                            first_prompt = text
+                elif t == 'model.completed':
+                    texts = (o.get('data') or {}).get('assistantTexts') or []
+                    if any(isinstance(x, str) and x.strip() for x in texts):
+                        msg_count += 1
+    except Exception as e:
+        log.error(f'openclaw history summary failed for {path}: {e}')
+        return None
+    if msg_count == 0:
+        return None
+    return {
+        'session_id':    session_id or path.name.split('.trajectory.jsonl')[0],
+        'title':         (first_prompt or 'Gespräch')[:60],
+        'updated_at':    last_ts or _iso_from_mtime(path),
+        'message_count': msg_count,
+    }
+
+
+def _read_openclaw_detail(path):
+    messages = []
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                t = o.get('type')
+                ts = o.get('ts', '')
+                if t == 'prompt.submitted':
+                    text = ((o.get('data') or {}).get('prompt') or '').strip()
+                    if text:
+                        messages.append({'role': 'user', 'content': text, 'timestamp': ts})
+                elif t == 'model.completed':
+                    texts = (o.get('data') or {}).get('assistantTexts') or []
+                    joined = '\n\n'.join(x.strip() for x in texts if isinstance(x, str) and x.strip())
+                    if joined:
+                        messages.append({'role': 'agent', 'content': joined, 'timestamp': ts})
+    except Exception as e:
+        log.error(f'openclaw history detail failed for {path}: {e}')
+        return None
+    return messages
+
+
+# --- Dispatch (Backend anhand cli_command wählen) ---
+
+def _history_session_files(cfg):
+    binary = _cli_binary(cfg)
+    if not binary:
+        return [], None
+    if 'openclaw' in os.path.basename(binary):
+        return _openclaw_session_files(cfg, binary), 'openclaw'
+    return _claude_session_files(cfg), 'claude'
+
+
+def build_history_list(cfg):
+    files, backend = _history_session_files(cfg)
+    if backend is None:
+        return []
+    reader = _read_openclaw_summary if backend == 'openclaw' else _read_claude_summary
+    entries = []
+    for path in files:
+        entry = reader(path)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def build_history_detail(cfg, session_id):
+    files, backend = _history_session_files(cfg)
+    if backend is None:
+        return None
+    reader = _read_openclaw_detail if backend == 'openclaw' else _read_claude_detail
+    for path in files:
+        # Claude-Dateiname == Session-ID exakt; Openclaw-Dateiname beginnt damit
+        # (Suffix .trajectory.jsonl).
+        if path.stem == session_id or path.name.startswith(session_id):
+            return reader(path)
+    return None
+
+
+def send_history(cfg):
+    """Liest alle Gesprächs-Sessions des konfigurierten Agenten (Zusammenfassung:
+    Titel, Datum, Nachrichtenzahl) und schickt sie an den Server.
+    Wird via MQTT action=send-history ausgelöst (App öffnet den Verlauf-Tab)."""
+    try:
+        entries = build_history_list(cfg)
+    except Exception as e:
+        log.error(f'send_history: build_history_list failed: {e}')
+        entries = []
+
+    while entries and len(json.dumps(entries)) > HISTORY_UPLOAD_MAX_CHARS:
+        entries.pop()  # älteste (am Ende, da neuste zuerst sortiert) zuerst raus
+
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_history.php',
+            json={'token_b': cfg['token_b'], 'kind': 'list', 'history': entries},
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        log.info(f'History list sent ({len(entries)} Gespräche)')
+    except Exception as e:
+        log.error(f'send_history: post failed: {e}')
+
+
+def send_history_detail(cfg, session_id):
+    """Liest das volle Transkript einer Session und schickt es an den Server.
+    Wird via MQTT action=send-history-detail ausgelöst (Nutzer tippt ein
+    Gespräch im Verlauf-Tab an)."""
+    if not session_id:
+        log.warning('send_history_detail: no session_id in payload')
+        return
+    try:
+        messages = build_history_detail(cfg, session_id)
+    except Exception as e:
+        log.error(f'send_history_detail: build_history_detail failed: {e}')
+        messages = None
+    if messages is None:
+        messages = []
+
+    while messages and len(json.dumps(messages)) > HISTORY_UPLOAD_MAX_CHARS:
+        messages.pop(0)  # älteste Nachrichten zuerst verwerfen, Gesprächsende behalten
+
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_history.php',
+            json={'token_b': cfg['token_b'], 'kind': 'detail', 'session_id': session_id, 'messages': messages},
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        log.info(f'History detail sent for session {session_id} ({len(messages)} Nachrichten)')
+    except Exception as e:
+        log.error(f'send_history_detail: post failed: {e}')
+
+
+# ─────────────────────────────────────────────
 # MQTT
 # ─────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
@@ -715,6 +1068,10 @@ def on_message(client, userdata, msg):
         perform_self_update(cfg)
     elif action == 'send-log':
         send_bridge_log(cfg)
+    elif action == 'send-history':
+        send_history(cfg)
+    elif action == 'send-history-detail':
+        send_history_detail(cfg, payload.get('session_id', ''))
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
