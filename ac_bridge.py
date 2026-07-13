@@ -993,7 +993,10 @@ def send_history(cfg):
         if 'token_b_new' in data:
             cfg['token_b'] = data['token_b_new']
             save_config(cfg)
-        log.info(f'History list sent ({len(entries)} Gespräche)')
+        if data.get('status') == 'ok':
+            log.info(f'History list sent ({len(entries)} Gespräche)')
+        else:
+            log.error(f'send_history: server rejected upload (HTTP {r.status_code}): {data}')
     except Exception as e:
         log.error(f'send_history: post failed: {e}')
 
@@ -1026,7 +1029,10 @@ def send_history_detail(cfg, session_id):
         if 'token_b_new' in data:
             cfg['token_b'] = data['token_b_new']
             save_config(cfg)
-        log.info(f'History detail sent for session {session_id} ({len(messages)} Nachrichten)')
+        if data.get('status') == 'ok':
+            log.info(f'History detail sent for session {session_id} ({len(messages)} Nachrichten)')
+        else:
+            log.error(f'send_history_detail: server rejected upload (HTTP {r.status_code}): {data}')
     except Exception as e:
         log.error(f'send_history_detail: post failed: {e}')
 
