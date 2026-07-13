@@ -21,6 +21,7 @@ Konfiguration: config.json im gleichen Verzeichnis
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -861,6 +862,87 @@ def _openclaw_session_files(cfg, cli_binary):
     return matches
 
 
+# Openclaw wrapt eingehende Nachrichten aus manchen Kanälen (z.B. Telegram) mit
+# Metadaten-Blöcken und einer wiederholten, chronologischen Kontext-Historie
+# (inkl. bereits gezeigter Agenten-Antworten) für das Modell. Ohne Bereinigung
+# würde der Verlauf-Tab als Titel/erste Nachricht diesen ganzen Wrapper zeigen
+# statt der eigentlichen neuen Nutzer-Nachricht. Beispielstruktur:
+#
+#   Conversation info (untrusted metadata):
+#   ```json
+#   { "chat_id": "...", ... }
+#   ```
+#
+#   Sender (untrusted metadata):
+#   ```json
+#   { "label": "...", ... }
+#   ```
+#
+#   Conversation context (untrusted, chronological, selected for current message):
+#   #3275 Sat 2026-06-13 20:38 GMT+2 Ingo Keutgen: <alte Nachricht>
+#   #3277 ... OpenClaw: <alte Antwort>
+#
+#   <eigentliche neue Nachricht>
+_OPENCLAW_CONTEXT_MARKER = (
+    'Conversation context (untrusted, chronological, selected for current message):'
+)
+_OPENCLAW_METADATA_BLOCK_RE = re.compile(
+    r'(?:Conversation info|Sender) \(untrusted metadata\):\s*```json.*?```\s*',
+    re.DOTALL
+)
+
+# Standard-System-Prompts (siehe ios_app_endpoint.php $sp_chat/$sp_siri bzw.
+# L10n.defaultSystemPromptChat/Siri in der App) — bei Backends ohne eigenes
+# System-Prompt-CLI-Flag (aktueller Openclaw-Default, cli_system_prompt_param='')
+# hängt call_agent_cli() den System-Prompt direkt vor den Prompt:
+# f'{system_prompt}\n\n{prompt}'. Exaktes Matchen statt einer Heuristik, da die
+# Standard-Prompts selbst mehrere \n\n enthalten (ein simples "letzter Absatz"-
+# Split würde dort falsch schneiden). Individuell angepasste System-Prompts
+# werden nicht erkannt und bleiben unverändert (kein Rückschritt ggü. vorher).
+_OPENCLAW_KNOWN_SYSTEM_PROMPTS = (
+    "Du bist ein hilfreicher Assistent. Deine Antworten werden per Text-Nachricht übermittelt.\nHalte dich an die folgenden Regeln:\n\n## Formatierung\nNutze gerne für die bessere Lesbarkeit in den Antworten übliche Markdown-Auszeichnungen.",
+    "You are a helpful assistant. Your answers are delivered via text message.\nFollow these rules:\n\n## Formatting\nFeel free to use common Markdown formatting to improve readability.",
+    "Du bist ein hilfreicher Sprachassistent. Deine Antworten werden per Text-to-Speech vorgelesen. Halte dich strikt an diese Regeln:\n\n## Antwortstil\n- Antworte in natürlicher, gesprochener Sprache — als würdest du mit jemandem reden, nicht schreiben.\n- Halte Antworten KURZ. Maximal 2–3 Sätze, außer es wird ausdrücklich mehr Detail verlangt.\n- Verwende kein Markdown: keine Aufzählungszeichen, keine Fettschrift, keine Überschriften, keine Listen, keine Codeblöcke.\n- Verwende keine Abkürzungen, die beim Vorlesen seltsam klingen. Schreibe \"zum Beispiel\" statt \"z.B.\".\n- Zahlen und Einheiten ausschreiben: \"drei Kilometer\" statt \"3 km\".\n- Keine Klammern, Schrägstriche oder Sonderzeichen.\n\n## Gesprächsstil\n- Komm direkt zum Punkt. Erst die Antwort, dann — wenn nötig — kurzer Kontext.\n- Bei mehrdeutigen Fragen: eine vernünftige Annahme treffen und kurz benennen.\n- Maximal eine Rückfrage stellen, und nur wenn sie wirklich nötig ist.\n- Aktionen mit kurzen, natürlichen Sätzen bestätigen: \"Erledigt, der Timer läuft.\" — nicht \"Ich habe die angeforderte Aktion erfolgreich ausgeführt.\"\n\n## Sprache\n- Immer auf Deutsch antworten, unabhängig von der Eingabe.\n- Warmer, gesprächiger Ton — nicht förmlich, nicht steif.\n\n## Grenzen\n- Wenn etwas nicht möglich ist: einen kurzen Satz, und wenn möglich eine Alternative anbieten.\n\n## Quellenangaben\n- Gebe die Quellen nur als Überschrift an\n- Gebe detaillierte Quellen wie URLs nur auf Rückfragen an",
+    "You are a helpful voice assistant. Your answers will be read aloud via text-to-speech. Follow these rules strictly:\n\n## Response style\n- Answer in natural, spoken language — as if talking to someone, not writing.\n- Keep answers SHORT. Maximum 2–3 sentences, unless more detail is explicitly requested.\n- Use no Markdown: no bullet points, no bold, no headings, no lists, no code blocks.\n- Avoid abbreviations that sound strange when read aloud. Write \"for example\" instead of \"e.g.\".\n- Write out numbers and units: \"three kilometers\" instead of \"3 km\".\n- No parentheses, slashes, or special characters.\n\n## Conversation style\n- Get straight to the point. Answer first, then — if needed — brief context.\n- For ambiguous questions: make a reasonable assumption and briefly state it.\n- Ask at most one follow-up question, and only if truly necessary.\n- Confirm actions with short, natural sentences: \"Done, the timer is running.\" — not \"I have successfully executed the requested action.\"\n\n## Language\n- Always answer in English, regardless of the input.\n- Warm, conversational tone — not formal, not stiff.\n\n## Limits\n- If something is not possible: one short sentence, and if possible offer an alternative.\n\n## Sources\n- Mention sources as headings only\n- Provide detailed sources like URLs only when asked",
+)
+
+
+_OPENCLAW_LEADING_TIMESTAMP_RE = re.compile(r'^\[[^\[\]]{1,60}\]\s*')
+
+
+def _openclaw_strip_system_prompt(text):
+    # Manche Kanäle stellen der ganzen Nachricht (System-Prompt inklusive) einen
+    # Zeitstempel wie "[Sat 2026-06-13 20:52 GMT+2] " voran.
+    lead_match = _OPENCLAW_LEADING_TIMESTAMP_RE.match(text)
+    lead = lead_match.group(0) if lead_match else ''
+    body = text[len(lead):]
+    for sp in _OPENCLAW_KNOWN_SYSTEM_PROMPTS:
+        prefix = sp + '\n\n'
+        if body.startswith(prefix):
+            return body[len(prefix):]
+    return text
+
+
+def _openclaw_extract_current_message(prompt_text):
+    text = _openclaw_strip_system_prompt(prompt_text)
+    idx = text.find(_OPENCLAW_CONTEXT_MARKER)
+    if idx != -1:
+        after = text[idx + len(_OPENCLAW_CONTEXT_MARKER):]
+        lines = after.split('\n')
+        last_context_line = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith('#'):
+                last_context_line = i
+        remainder = '\n'.join(lines[last_context_line + 1:]).strip()
+        if remainder:
+            return remainder
+        # Nichts nach der letzten Kontext-Zeile gefunden — auf die verbleibenden
+        # Metadaten-Blöcke unten zurückfallen, statt leer zurückzugeben.
+        text = after
+
+    return _OPENCLAW_METADATA_BLOCK_RE.sub('', text).strip()
+
+
 def _read_openclaw_summary(path):
     session_id = None
     last_ts = None
@@ -882,7 +964,8 @@ def _read_openclaw_summary(path):
                     last_ts = o['ts']
                 t = o.get('type')
                 if t == 'prompt.submitted':
-                    text = ((o.get('data') or {}).get('prompt') or '').strip()
+                    raw = ((o.get('data') or {}).get('prompt') or '').strip()
+                    text = _openclaw_extract_current_message(raw) if raw else ''
                     if text:
                         msg_count += 1
                         if first_prompt is None:
@@ -919,7 +1002,8 @@ def _read_openclaw_detail(path):
                 t = o.get('type')
                 ts = o.get('ts', '')
                 if t == 'prompt.submitted':
-                    text = ((o.get('data') or {}).get('prompt') or '').strip()
+                    raw = ((o.get('data') or {}).get('prompt') or '').strip()
+                    text = _openclaw_extract_current_message(raw) if raw else ''
                     if text:
                         messages.append({'role': 'user', 'content': text, 'timestamp': ts})
                 elif t == 'model.completed':
