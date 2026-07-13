@@ -77,11 +77,14 @@ def _sanitize_identifier(text):
 
 
 def _install_dir_tag():
-    """Kurzes Kennzeichen für dieses Installationsverzeichnis. Sorgt dafür, dass
-    mehrere Bridge-Installationen unter derselben E-Mail (z.B. eine für Claude,
-    eine für Openclaw) unterschiedliche Service-Namen bekommen, statt sich beim
-    Setup gegenseitig zu deaktivieren (siehe remove_existing_services)."""
-    return _sanitize_identifier(Path(__file__).resolve().parent.name)
+    """Kennzeichen für dieses Installationsverzeichnis, aus dem VOLLEN absoluten
+    Pfad gebildet (nicht nur dem Verzeichnisnamen) — nach einem 'git clone' heißt
+    das Verzeichnis meist überall gleich (z.B. 'ac-bridge'), nur der Pfad davor
+    unterscheidet zwei Installationen. Sorgt dafür, dass mehrere Bridge-Installationen
+    unter derselben E-Mail (z.B. eine für Claude, eine für Openclaw) unterschiedliche
+    Service-Namen bekommen, statt sich beim Setup gegenseitig zu deaktivieren
+    (siehe remove_existing_services)."""
+    return _sanitize_identifier(str(Path(__file__).resolve().parent))
 
 
 def sanitize_service_name(email):
