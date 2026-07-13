@@ -1054,6 +1054,75 @@ def build_history_detail(cfg, session_id):
     return None
 
 
+def build_history_delete_paths(cfg, session_id):
+    """Ermittelt die zu löschenden Dateien für eine Session. Claude: nur die
+    .jsonl (Hilfsverzeichnisse unter session-env/ und file-history/ werden
+    bewusst nicht angefasst — verwaistes Datenmüll ohne Funktion, aber ein
+    Löschversuch dort wäre riskanter als der Nutzen). Openclaw: die
+    .trajectory.jsonl plus das zugehörige .trajectory-path.json-Sidecar."""
+    files, backend = _history_session_files(cfg)
+    if backend is None:
+        return []
+    for path in files:
+        if path.stem == session_id or path.name.startswith(session_id):
+            if backend == 'claude':
+                return [path]
+            sidecar = path.with_name(path.name[:-len('.trajectory.jsonl')] + '.trajectory-path.json')
+            return [path, sidecar] if sidecar.exists() else [path]
+    return []
+
+
+def delete_history_session(cfg, session_id):
+    """Löscht die Datei(en) einer Gesprächs-Session lokal auf dem Agent-Rechner.
+    Wird via MQTT action=delete-history-session ausgelöst (Swipe-to-Delete im
+    Verlauf-Tab). Die App entfernt den Eintrag bereits optimistisch aus der
+    Liste, ohne auf eine Bestätigung zu warten — das Ergebnis geht hier nur
+    zu Logging-Zwecken an den Server."""
+    errors = []
+    deleted = []
+    if not session_id:
+        errors.append('keine session_id übergeben')
+    else:
+        try:
+            paths = build_history_delete_paths(cfg, session_id)
+        except Exception as e:
+            paths = []
+            errors.append(f'Ermittlung der Pfade fehlgeschlagen: {e}')
+        if not paths and not errors:
+            errors.append(f'keine Datei für session_id={session_id} gefunden')
+        for path in paths:
+            try:
+                path.unlink()
+                deleted.append(str(path))
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                errors.append(f'{path}: {e}')
+
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_history.php',
+            json={
+                'token_b': cfg['token_b'],
+                'kind': 'delete',
+                'session_id': session_id,
+                'success': not errors,
+                'detail': '; '.join(errors) if errors else f'{len(deleted)} Datei(en) gelöscht',
+            },
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        if data.get('status') == 'ok':
+            log.info(f'delete_history_session: session={session_id} deleted={deleted} errors={errors}')
+        else:
+            log.error(f'delete_history_session: server rejected report (HTTP {r.status_code}): {data}')
+    except Exception as e:
+        log.error(f'delete_history_session: report post failed: {e}')
+
+
 def send_history(cfg):
     """Liest alle Gesprächs-Sessions des konfigurierten Agenten (Zusammenfassung:
     Titel, Datum, Nachrichtenzahl) und schickt sie an den Server.
@@ -1162,6 +1231,8 @@ def on_message(client, userdata, msg):
         send_history(cfg)
     elif action == 'send-history-detail':
         send_history_detail(cfg, payload.get('session_id', ''))
+    elif action == 'delete-history-session':
+        delete_history_session(cfg, payload.get('session_id', ''))
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
