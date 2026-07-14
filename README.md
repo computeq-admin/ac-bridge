@@ -22,7 +22,9 @@ The bridge runs as a systemd user service, listens for MQTT wakeup signals, call
 git clone https://github.com/computeq-admin/ac-bridge.git
 cd ac-bridge
 
-# 2. Install (creates venv, installs dependencies)
+# 2. Make the installer executable (the executable bit is not preserved by
+#    git clone for this file) and run it (creates venv, installs dependencies)
+chmod +x install.sh
 ./install.sh
 ```
 
@@ -72,7 +74,7 @@ The bridge receives the updated config via MQTT automatically.
 
 > Please install the AC Bridge on this machine:
 > 1. `git clone https://github.com/computeq-admin/ac-bridge.git`
-> 2. `cd ac-bridge && ./install.sh`
+> 2. `cd ac-bridge && chmod +x install.sh && ./install.sh`
 > 3. `python3 setup.py --get-token`
 >
 > Show me the QR code from the terminal. I will scan it with the Agent Talk iOS app and give you a 6-digit OTT.
