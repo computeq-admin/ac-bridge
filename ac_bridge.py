@@ -1204,20 +1204,31 @@ def send_history_detail(cfg, session_id):
 # ─────────────────────────────────────────────
 # MQTT
 # ─────────────────────────────────────────────
+def _on_connect_tasks(cfg):
+    # NACHEINANDER in einem einzigen Thread, nicht als zwei parallele Threads:
+    # Token-B ist single-use (jeder Request rotiert ihn serverseitig). Liefen
+    # send_pong() und apply_config_update() gleichzeitig, lasen beide denselben
+    # cfg['token_b'], und wer beim Server als Zweiter ankam bekam token_b_invalid
+    # (der Erste hatte ihn bereits rotiert) — genau das verursachte die
+    # "Unexpected ping response: {'error': 'token_b_invalid'}"-Fehler nach jedem
+    # Connect. Sequenziell verwenden beide immer den aktuell gültigen Token.
+    send_pong(cfg)
+    # Proaktiv statt nur MQTT-getriggert: eine frisch angelegte Bridge/Profil hat
+    # evtl. noch nie ein 'update-config' erhalten (z.B. weil der Nutzer nach dem
+    # Pairing nie manuell auf "Speichern" getippt hat, obwohl das Profil
+    # serverseitig schon Standard-Werte hat). apply_config_update() ist ein No-Op,
+    # wenn nichts aussteht (bridge_config_pending=0) — bei jedem (Re-)Connect
+    # aufzurufen ist daher unschädlich und schließt genau diese Lücke.
+    apply_config_update(cfg)
+
+
 def on_connect(client, userdata, flags, rc):
     cfg = userdata
     if rc == 0:
         topic = f"ac/{cfg['token_a']}"
         client.subscribe(topic, qos=1)
         log.info(f'Connected to MQTT broker, subscribed to: {topic}')
-        threading.Thread(target=send_pong, args=(cfg,), daemon=True).start()
-        # Proaktiv statt nur MQTT-getriggert: eine frisch angelegte Bridge/Profil
-        # hat evtl. noch nie ein 'update-config' erhalten (z.B. weil der Nutzer nach
-        # dem Pairing nie manuell auf "Speichern" getippt hat, obwohl das Profil
-        # serverseitig schon Standard-Werte hat). apply_config_update() ist ein No-Op,
-        # wenn nichts aussteht (bridge_config_pending=0) — bei jedem (Re-)Connect
-        # aufzurufen ist daher unschädlich und schließt genau diese Lücke.
-        threading.Thread(target=apply_config_update, args=(cfg,), daemon=True).start()
+        threading.Thread(target=_on_connect_tasks, args=(cfg,), daemon=True).start()
     else:
         log.error(f'MQTT connect failed, rc={rc}')
 
