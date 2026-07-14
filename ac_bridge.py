@@ -529,9 +529,8 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
             log.info(f'Passing system prompt via param "{sp_param}" ({len(system_prompt)} chars): "{system_prompt[:120]}"')
             cmd += [sp_param, system_prompt]
         else:
-            framed = _frame_one_time_system_prompt(system_prompt, cfg.get('lang', 'DE'))
-            log.info(f'No sp_param configured — prepending framed (one-time) system prompt to prompt ({len(system_prompt)} chars): "{system_prompt[:120]}"')
-            prompt = f'{framed}\n\n{prompt}' if prompt else framed
+            log.info(f'No sp_param configured — prepending system prompt to prompt ({len(system_prompt)} chars): "{system_prompt[:120]}"')
+            prompt = f'{system_prompt}\n\n{prompt}' if prompt else system_prompt
     else:
         log.info('No system prompt passed to agent CLI.')
 
@@ -918,29 +917,6 @@ _OPENCLAW_KNOWN_SYSTEM_PROMPTS = (
     "You are a helpful voice assistant. Your answers will be read aloud via text-to-speech. Follow these rules strictly:\n\n## Response style\n- Answer in natural, spoken language — as if talking to someone, not writing.\n- Keep answers SHORT. Maximum 2–3 sentences, unless more detail is explicitly requested.\n- Use no Markdown: no bullet points, no bold, no headings, no lists, no code blocks.\n- Avoid abbreviations that sound strange when read aloud. Write \"for example\" instead of \"e.g.\".\n- Write out numbers and units: \"three kilometers\" instead of \"3 km\".\n- No parentheses, slashes, or special characters.\n\n## Conversation style\n- Get straight to the point. Answer first, then — if needed — brief context.\n- For ambiguous questions: make a reasonable assumption and briefly state it.\n- Ask at most one follow-up question, and only if truly necessary.\n- Confirm actions with short, natural sentences: \"Done, the timer is running.\" — not \"I have successfully executed the requested action.\"\n\n## Language\n- Always answer in English, regardless of the input.\n- Warm, conversational tone — not formal, not stiff.\n\n## Limits\n- If something is not possible: one short sentence, and if possible offer an alternative.\n\n## Sources\n- Mention sources as headings only\n- Provide detailed sources like URLs only when asked",
 )
 
-# Openclaw kennt keine System-Message, die nur für einen einzelnen Turn gilt
-# (recherchiert: weder 'openclaw agent' noch 'agent send' haben ein Äquivalent zu
-# Claude CLIs --system-prompt/--append-system-prompt — offizielle Doku geprüft,
-# Stand 2026-07). Der System-Prompt landet daher als roher Text im Prompt und
-# bleibt bei einer fortgesetzten Openclaw-Session (persistente Historie) Teil des
-# Gesprächsverlaufs — ohne Hinweis könnte das Modell ihn fälschlich als weiterhin
-# geltend ansehen. Dieses Framing macht den Einmal-Charakter explizit. Wird sowohl
-# beim Einbetten (call_agent_cli) als auch beim Entfernen für den Verlauf-Tab
-# (_openclaw_strip_system_prompt) verwendet, damit beide Seiten synchron bleiben.
-_ONE_TIME_SYSTEM_PROMPT_FRAME = {
-    'DE': ('[Hinweis: Die folgende Anweisung gilt NUR für diese eine Antwort, '
-           'nicht für künftige Nachrichten in diesem Gespräch]\n{sp}\n'
-           '[Ende der einmaligen Anweisung]'),
-    'EN': ('[Note: The following instruction applies ONLY to this one response, '
-           'not to future messages in this conversation]\n{sp}\n'
-           '[End of one-time instruction]'),
-}
-
-
-def _frame_one_time_system_prompt(system_prompt, lang):
-    frame = _ONE_TIME_SYSTEM_PROMPT_FRAME.get(lang, _ONE_TIME_SYSTEM_PROMPT_FRAME['EN'])
-    return frame.format(sp=system_prompt)
-
 
 _OPENCLAW_LEADING_TIMESTAMP_RE = re.compile(r'^\[[^\[\]]{1,60}\]\s*')
 
@@ -952,15 +928,6 @@ def _openclaw_strip_system_prompt(text):
     lead = lead_match.group(0) if lead_match else ''
     body = text[len(lead):]
     for sp in _OPENCLAW_KNOWN_SYSTEM_PROMPTS:
-        # Aktuelles Format: mit Einmaligkeits-Hinweis eingerahmt (siehe
-        # _frame_one_time_system_prompt). Beide Sprachvarianten prüfen, unabhängig
-        # von der aktuell konfigurierten cfg['lang'] — alte Sessions können in der
-        # jeweils anderen Sprache aufgezeichnet worden sein.
-        for frame in _ONE_TIME_SYSTEM_PROMPT_FRAME.values():
-            framed_prefix = frame.format(sp=sp) + '\n\n'
-            if body.startswith(framed_prefix):
-                return body[len(framed_prefix):]
-        # Altes Format (vor dem Framing-Fix): reiner System-Prompt ohne Rahmen.
         prefix = sp + '\n\n'
         if body.startswith(prefix):
             return body[len(prefix):]
