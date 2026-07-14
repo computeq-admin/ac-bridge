@@ -68,10 +68,6 @@ ALLOWED_CLI_EXECUTABLES = {
 REPO_DIR         = Path(__file__).resolve().parent
 GITHUB_FETCH_URL = 'https://github.com/computeq-admin/ac-bridge.git'
 GIT_BRANCH       = 'main'
-UPDATE_CHECK_TTL = 3600  # Sekunden: Remote-Versionscheck höchstens stündlich
-
-# Gecachter Update-Status (wird im Heartbeat an den Server gemeldet)
-_update_status = {'commit': '', 'available': False, 'ts': 0.0}
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -208,39 +204,6 @@ def _git_local_commit():
         return ''
 
 
-def _git_remote_commit():
-    """Vollständiger Remote-Commit-Hash von origin/main via HTTPS oder '' bei Fehler."""
-    try:
-        out = subprocess.run(
-            ['git', 'ls-remote', GITHUB_FETCH_URL, f'refs/heads/{GIT_BRANCH}'],
-            capture_output=True, text=True, timeout=20,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.split()[0].strip()
-    except Exception as e:
-        log.error(f'git ls-remote failed: {e}')
-    return ''
-
-
-def refresh_update_status(force=False):
-    """Vergleicht lokalen mit Remote-Commit, max. einmal pro UPDATE_CHECK_TTL.
-
-    Aktualisiert den gecachten _update_status (commit kurz + available). Vergleich
-    erfolgt über die vollen Hashes, gemeldet/angezeigt wird der gekürzte Commit."""
-    now = time.time()
-    if not force and (now - _update_status['ts'] < UPDATE_CHECK_TTL):
-        return
-    local  = _git_local_commit()
-    remote = _git_remote_commit()
-    if local:
-        _update_status['commit'] = local[:7]
-        # Nur als veraltet melden, wenn der Remote-Check erfolgreich war.
-        _update_status['available'] = bool(remote and local != remote)
-        _update_status['ts'] = now
-        log.info(f'Update check: local={local[:7]} remote={remote[:7] or "?"} '
-                 f'available={_update_status["available"]}')
-
-
 def perform_self_update(cfg):
     """git fetch + hard reset auf origin/main (HTTPS), pip install, Service-Neustart.
 
@@ -274,7 +237,6 @@ def perform_self_update(cfg):
             log.error(f'pip install after update failed: {e}')
 
     # Neustart über systemd lädt den neuen Code (gleiches Muster wie update-config)
-    _update_status['ts'] = 0.0  # erzwingt frischen Check nach Neustart
     service_name = cfg.get('service_name', '')
     if service_name:
         log.info(f'Restarting service after update: {service_name}')
@@ -316,15 +278,21 @@ def send_bridge_log(cfg, max_lines=800):
 
 
 def send_pong(cfg):
-    """Antwortet auf Server-Ping, rotiert Token-B"""
-    refresh_update_status()
+    """Antwortet auf Server-Ping, rotiert Token-B.
+
+    Meldet nur den eigenen lokalen Commit-Hash (reines 'git rev-parse HEAD',
+    kein Netzwerk nötig — kann nicht fehlschlagen). Ob das ein Update braucht,
+    entscheidet die App selbst durch Vergleich mit dem aktuellen GitHub-Stand,
+    statt dass jede Bridge-Installation unabhängig per 'git ls-remote' gegen
+    GitHub prüft (fehleranfällig: schlägt der Netzwerk-Check auf einer einzelnen
+    Maschine lautlos fehl, wurde bisher "kein Update" gemeldet, obwohl der
+    gemeldete Hash längst veraltet war)."""
     try:
         r = requests.post(
             cfg['server_url'] + '/ping.php',
             json={
-                'token_b':          cfg['token_b'],
-                'bridge_commit':    _update_status['commit'],
-                'update_available': _update_status['available'],
+                'token_b':       cfg['token_b'],
+                'bridge_commit': _git_local_commit()[:7],
             },
             timeout=10,
         )
