@@ -453,6 +453,55 @@ def discover_openclaw_agent_id(cli_binary, cwd):
     return None
 
 
+def _nvm_bin_dir_for(executable_name):
+    """Sucht unter allen per nvm installierten Node-Versionen (~/.nvm/versions/node/*)
+    nach einer, die `executable_name` in ihrem bin/-Ordner hat (z.B. ein per
+    'npm install -g' unter nvm installiertes CLI wie openclaw). Bei mehreren Treffern
+    wird die höchste Node-Version bevorzugt (entspricht meist der aktiven Version).
+    Gibt den bin/-Pfad zurück, oder None wenn kein nvm/keine passende Version existiert."""
+    nvm_dir = Path(os.environ.get('NVM_DIR') or (Path.home() / '.nvm')).expanduser()
+    versions_dir = nvm_dir / 'versions' / 'node'
+    if not versions_dir.is_dir():
+        return None
+
+    def _semver_key(d):
+        m = re.match(r'v?(\d+)\.(\d+)\.(\d+)', d.name)
+        return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+    candidates = sorted(
+        (d for d in versions_dir.iterdir() if d.is_dir() and (d / 'bin' / executable_name).exists()),
+        key=_semver_key, reverse=True,
+    )
+    return str(candidates[0] / 'bin') if candidates else None
+
+
+def apply_nvm_path_fallback(cli_command):
+    """Stellt sicher, dass ein per nvm (statt global via npm) installiertes CLI-Tool
+    gefunden wird, auch wenn die Bridge als systemd-User-Service ohne geladenes
+    Shell-Profil läuft (und damit ohne die von nvm.sh üblicherweise gesetzte
+    PATH-Erweiterung). Greift nur, wenn cli_command ein bloßer Kommandoname ist (kein
+    Pfad) UND unter einer nvm-Node-Version gefunden wird — ein explizit konfigurierter
+    Pfad (z.B. ~/.npm-global/bin/openclaw) wird nie überschrieben. Einmalig beim
+    Bridge-Start aufrufen (main()); ein Config-Update mit geänderter cli_command
+    restartet den Service ohnehin, main() läuft dann neu."""
+    try:
+        executable = shlex.split(os.path.expanduser(cli_command or ''))[0]
+    except (IndexError, ValueError):
+        return
+    if '/' in executable:
+        return  # expliziter Pfad — nichts zu tun
+
+    bin_dir = _nvm_bin_dir_for(executable)
+    if not bin_dir:
+        return
+
+    os.environ['NVM_BIN'] = bin_dir
+    path_parts = os.environ.get('PATH', '').split(os.pathsep)
+    if bin_dir not in path_parts:
+        os.environ['PATH'] = bin_dir + os.pathsep + os.environ.get('PATH', '')
+    log.info(f'nvm-managed "{executable}" found, prepended to PATH: {bin_dir}')
+
+
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
@@ -1451,6 +1500,7 @@ def telegram_poll_loop(cfg):
 # ─────────────────────────────────────────────
 def main():
     cfg = load_config()
+    apply_nvm_path_fallback(cfg.get('cli_command', ''))
 
     telegram_only = cfg.get('telegram_only', False)
     client = None
