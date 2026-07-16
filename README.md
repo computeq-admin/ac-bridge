@@ -125,6 +125,26 @@ No interactive input needed — the AI agent can run this command directly.
 > ```
 > Replace `<TOKEN>` with the bot token from @BotFather and `<ID>` with your Telegram user ID.
 
+### Additional option — telegram-config.json (file-based, no command needed)
+
+Instead of `--set-telegram`, you can drop a `telegram-config.json` file directly
+into the bridge directory (next to `ac_bridge.py`):
+
+```json
+{
+  "telegram_chat_id": "",
+  "telegram_bot_token": "",
+  "telegram_system_prompt": ""
+}
+```
+
+On every bridge start, if this file exists, its fields are copied into
+`config.json` (overwriting whatever is currently set there) and Telegram starts
+alongside the normal Agent Connect/MQTT connection — no restart command needed,
+just start/restart the service. The file itself is left in place and re-applied
+on every start, not consumed once. `telegram_system_prompt` is optional; leave it
+empty to fall back to the Chat system prompt configured in the app/backend.
+
 ### Getting Telegram credentials
 
 You need two things: a **bot token** and your **chat ID**.

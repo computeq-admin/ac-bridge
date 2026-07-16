@@ -50,7 +50,9 @@ log = logging.getLogger('ac_bridge')
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
-CONFIG_FILE = Path(__file__).parent / 'config.json'
+CONFIG_FILE          = Path(__file__).parent / 'config.json'
+TELEGRAM_CONFIG_FILE = Path(__file__).parent / 'telegram-config.json'
+TELEGRAM_CONFIG_KEYS = ('telegram_chat_id', 'telegram_bot_token', 'telegram_system_prompt')
 
 PROTECTED_CONFIG_KEYS = {
     'token_a', 'mqtt_host', 'mqtt_port', 'mqtt_user',
@@ -79,6 +81,37 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
+
+def apply_local_telegram_config(cfg):
+    """Prüft bei jedem Bridge-Start, ob telegram-config.json im Bridge-Verzeichnis
+    liegt, und übernimmt deren Felder (telegram_chat_id, telegram_bot_token,
+    telegram_system_prompt) in config.json. Ermöglicht eine lokale Telegram-
+    Konfiguration unabhängig von App/Backend — z.B. wenn die normale MQTT/Agent-
+    Connect-Verbindung parallel weiterlaufen, Telegram aber lokal fest eingestellt
+    sein soll. Die Datei bleibt bestehen und wird bei jedem Start erneut angewendet
+    (kein einmaliger Verbrauch); Werte aus der Datei überschreiben, was aktuell in
+    config.json steht. Fehlt die Datei, passiert nichts."""
+    if not TELEGRAM_CONFIG_FILE.exists():
+        return
+    try:
+        with open(TELEGRAM_CONFIG_FILE) as f:
+            data = json.load(f)
+    except Exception as e:
+        log.error(f'telegram-config.json konnte nicht gelesen werden: {e}')
+        return
+
+    applied = [key for key in TELEGRAM_CONFIG_KEYS if key in data]
+    for key in applied:
+        cfg[key] = data[key]
+
+    if applied:
+        save_config(cfg)
+        log.info(f'telegram-config.json gefunden, Felder übernommen: {applied}')
+    else:
+        log.warning(
+            'telegram-config.json gefunden, aber keines der erwarteten Felder '
+            f'({", ".join(TELEGRAM_CONFIG_KEYS)}) enthalten.'
+        )
 
 def apply_config_update(cfg):
     """Holt ausstehende Config-Aktualisierung vom Server und wendet sie lokal an.
@@ -1473,6 +1506,7 @@ def telegram_poll_loop(cfg):
 # ─────────────────────────────────────────────
 def main():
     cfg = load_config()
+    apply_local_telegram_config(cfg)
     apply_nvm_path_fallback()
 
     telegram_only = cfg.get('telegram_only', False)
