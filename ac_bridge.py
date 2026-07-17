@@ -61,7 +61,7 @@ PROTECTED_CONFIG_KEYS = {
 }
 
 ALLOWED_CLI_EXECUTABLES = {
-    'claude', 'openclaw', 'copilot', 'gemini', 'aider', 'interpreter', 'goose',
+    'claude', 'openclaw', 'hermes', 'copilot', 'gemini', 'aider', 'interpreter', 'goose',
 }
 
 # ─────────────────────────────────────────────
@@ -498,6 +498,48 @@ def apply_nvm_path_fallback():
 
 
 # ─────────────────────────────────────────────
+# Hermes-Backend-Helfer
+# ─────────────────────────────────────────────
+# Hermes (Nous Research) weicht in zwei Punkten von Claude/Openclaw ab:
+#  1. Profil-Auswahl über die Umgebungsvariable HERMES_HOME (kein Per-Call-Flag).
+#  2. Kein JSON-Output: `hermes chat -q "…" -Q` liefert den Antworttext plus eine
+#     abschließende "session_id: <id>"-Zeile. Wir parsen das zeilenbasiert.
+_HERMES_SESSION_LINE_RE = re.compile(r'^session_id:\s*(\S+)\s*$', re.MULTILINE)
+
+
+def _is_hermes_binary(cmd0):
+    return 'hermes' in os.path.basename(cmd0)
+
+
+def _hermes_home_for(profile):
+    """Pfad zum Hermes-Home des gewählten Profils. Default-Profil liegt direkt in
+    ~/.hermes, benannte Profile unter ~/.hermes/profiles/<name>."""
+    base = Path.home() / '.hermes'
+    p = (profile or '').strip()
+    if not p or p.lower() == 'default':
+        return str(base)
+    return str(base / 'profiles' / p)
+
+
+def _parse_hermes_output(raw):
+    """Trennt Antworttext und Session-ID aus der Hermes -Q-Ausgabe.
+    Rückgabe (answer, session_id); answer=None bei leerer Antwort."""
+    sid = None
+    last = None
+    for last in _HERMES_SESSION_LINE_RE.finditer(raw):
+        pass  # letzte Übereinstimmung gewinnt (Trailer-Zeile)
+    if last:
+        sid = last.group(1)
+        answer = raw[:last.start()].strip()
+    else:
+        answer = raw.strip()
+    if not answer:
+        log.error(f'Hermes output has no answer text: {raw[:200]}')
+        return None, None
+    return answer, sid
+
+
+# ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
 def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
@@ -524,6 +566,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
         return None, None
 
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
+    is_hermes = _is_hermes_binary(cmd[0])
 
     # Session-Handling
     session_param    = cfg.get('cli_session_id_param', '')
@@ -535,6 +578,11 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
             origin = ' (App-Fortsetzen)' if session_id_override else ''
             cmd += [session_param, resume_id]
             log.info(f'Continuing session: {resume_id}{origin}')
+        elif is_hermes:
+            # Hermes: neue Session ohne Flag; die ID wird von Hermes selbst vergeben
+            # und aus der Ausgabe (session_id:-Zeile) gelesen. NICHT wie openclaw eine
+            # UUID vorgeben — --resume erwartet eine EXISTIERENDE Session.
+            log.info('Hermes: starting new session (no resume)')
         elif not session_id_field:
             # Input-Modus (z.B. openclaw): Session-ID wird immer übergeben,
             # kommt nicht aus dem Output → neue UUID generieren
@@ -593,6 +641,10 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
 
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
+    if is_hermes:
+        # Profil-Auswahl: HERMES_HOME zeigt auf das Home des gewählten Hermes-Profils.
+        env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
+        log.info(f'Hermes profile home: {env["HERMES_HOME"]}')
 
     cwd     = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     timeout = cfg.get('cli_timeout', 600)
@@ -619,27 +671,35 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
             log.error('CLI returned empty output')
             return None, None
 
-        # JSON-Output parsen wenn session_id_field gesetzt ODER answer_field Dot-Notation enthält
-        answer_field     = cfg.get('cli_answer_output_field', 'result')
-        parse_json       = bool(session_id_field) or '.' in answer_field
-        extracted_sid    = None
-        if parse_json:
-            try:
-                data = json.loads(raw)
-                if session_id_field:
-                    new_sid = json_get(data, session_id_field) or ''
-                    if new_sid:
-                        extracted_sid = str(new_sid)
-                        store_session_id(extracted_sid)
-                answer = (json_get(data, answer_field) or '').strip()
-                if not answer:
-                    log.error(f'JSON output has no "{answer_field}" field: {raw[:200]}')
-                    return None, None
-            except json.JSONDecodeError:
-                log.error(f'Expected JSON output but got: {raw[:200]}')
+        extracted_sid = None
+        if is_hermes:
+            # Hermes: zeilenbasiert (kein JSON) — Antwort + abschließende session_id-Zeile.
+            answer, extracted_sid = _parse_hermes_output(raw)
+            if answer is None:
                 return None, None
+            if extracted_sid:
+                store_session_id(extracted_sid)
         else:
-            answer = raw
+            # JSON-Output parsen wenn session_id_field gesetzt ODER answer_field Dot-Notation enthält
+            answer_field = cfg.get('cli_answer_output_field', 'result')
+            parse_json   = bool(session_id_field) or '.' in answer_field
+            if parse_json:
+                try:
+                    data = json.loads(raw)
+                    if session_id_field:
+                        new_sid = json_get(data, session_id_field) or ''
+                        if new_sid:
+                            extracted_sid = str(new_sid)
+                            store_session_id(extracted_sid)
+                    answer = (json_get(data, answer_field) or '').strip()
+                    if not answer:
+                        log.error(f'JSON output has no "{answer_field}" field: {raw[:200]}')
+                        return None, None
+                except json.JSONDecodeError:
+                    log.error(f'Expected JSON output but got: {raw[:200]}')
+                    return None, None
+            else:
+                answer = raw
 
         log.info(f'CLI answered ({len(answer)} chars)')
         return answer, extracted_sid
@@ -1061,6 +1121,184 @@ def _read_openclaw_detail(path):
     return messages
 
 
+# --- Hermes (Sessions liegen in SQLite, Zugriff über die hermes-CLI statt Dateien) ---
+
+def _is_hermes_cfg(cfg):
+    return _is_hermes_binary(_cli_binary(cfg))
+
+
+def _hermes_run(cfg, args, timeout=60):
+    """Führt `<hermes-binary> <args>` mit gesetztem HERMES_HOME (Profil-Home) aus.
+    cli_command kann 'hermes chat' sein — für sessions/profile zählt nur das Binary
+    (cmd[0]). Gibt stdout (str) zurück oder None bei Fehler."""
+    binary = _cli_binary(cfg)
+    if not binary:
+        return None
+    env = os.environ.copy()
+    env.update(cfg.get('cli_env', {}))
+    env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
+    cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
+    try:
+        r = subprocess.run([binary] + args, capture_output=True, text=True,
+                           env=env, cwd=cwd, timeout=timeout)
+    except Exception as e:
+        log.error(f'hermes {args[:2]} failed: {e}')
+        return None
+    if r.returncode != 0:
+        log.error(f'hermes {args[:2]} exited {r.returncode}: {r.stderr[:300]}')
+        return None
+    return r.stdout
+
+
+def _hermes_sid_to_iso(sid):
+    """Der Zeitstempel steckt im ID-Präfix (YYYYMMDD_HHMMSS, lokale Zeit) — präziser
+    als die relative 'Last Active'-Spalte der Tabelle."""
+    m = re.match(r'(\d{8})_(\d{6})', sid or '')
+    if not m:
+        return ''
+    try:
+        from datetime import datetime
+        return datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S').astimezone().isoformat()
+    except Exception:
+        return ''
+
+
+def _hermes_epoch_to_iso(ts):
+    if not ts:
+        return ''
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return ''
+
+
+def _parse_hermes_sessions_table(text):
+    """Parst `hermes sessions list`. Spalten sind durch 2+ Leerzeichen getrennt
+    (Titel selbst enthält nur einfache Leerzeichen) — robuster als Offset-Slicing.
+    Die ID ist das Feld im Format YYYYMMDD_HHMMSS…, der Titel steht ganz vorne."""
+    lines = text.splitlines()
+    header_idx = next((i for i, l in enumerate(lines)
+                       if 'Title' in l and 'ID' in l and 'Last Active' in l), None)
+    if header_idx is None:
+        return []
+    entries = []
+    for line in lines[header_idx + 1:]:
+        s = line.strip()
+        if not s or set(s) <= set('─-—│| '):  # leer oder Trennlinie (inkl. Leerzeichen)
+            continue
+        parts = re.split(r'\s{2,}', s)
+        sid = next((p.split()[0] for p in parts if re.match(r'\d{8}_\d{6}', p)), '')
+        if not sid:
+            continue
+        title = parts[0] if parts and not re.match(r'\d{8}_\d{6}', parts[0]) else ''
+        entries.append({
+            'session_id':    sid,
+            'title':         title or 'Gespräch',
+            'updated_at':    _hermes_sid_to_iso(sid),
+            'message_count': 0,
+        })
+    return entries
+
+
+def _hermes_history_list(cfg):
+    out = _hermes_run(cfg, ['sessions', 'list', '--limit', '200'], timeout=60)
+    return _parse_hermes_sessions_table(out) if out is not None else []
+
+
+def _hermes_history_detail(cfg, session_id):
+    out = _hermes_run(cfg, ['sessions', 'export', '-', '--format', 'jsonl',
+                            '--session-id', session_id], timeout=120)
+    if out is None:
+        return None
+    messages = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        for m in obj.get('messages', []) if isinstance(obj, dict) else []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get('role')
+            content = (m.get('content') or '').strip()
+            ts = _hermes_epoch_to_iso(m.get('timestamp'))
+            # Nur sichtbare Nutzer-/Agenten-Nachrichten. Raus: tool, session_meta,
+            # leere assistant-Turns (nur tool_calls) und alle reasoning*-Felder.
+            if role == 'user' and content:
+                messages.append({'role': 'user', 'content': content, 'timestamp': ts})
+            elif role == 'assistant' and content:
+                messages.append({'role': 'agent', 'content': content, 'timestamp': ts})
+    return messages
+
+
+def _hermes_delete_session(cfg, session_id):
+    """Löscht eine Hermes-Session headless. Rückgabe (deleted, errors)."""
+    out = _hermes_run(cfg, ['sessions', 'delete', '--yes', session_id], timeout=30)
+    if out is None:
+        return [], [f'hermes sessions delete für {session_id} fehlgeschlagen']
+    return [f'hermes session {session_id}'], []
+
+
+def _parse_hermes_profiles_table(text):
+    """Parst `hermes profile list`. Spalten durch 2+ Leerzeichen getrennt; erste
+    Spalte = Profilname (◆ markiert das aktive sticky-default-Profil).
+    Liefert [{name, active, model}]."""
+    lines = text.splitlines()
+    header_idx = next((i for i, l in enumerate(lines)
+                       if 'Profile' in l and 'Model' in l), None)
+    if header_idx is None:
+        return []
+    profiles = []
+    for line in lines[header_idx + 1:]:
+        s = line.strip()
+        if not s or set(s) <= set('─-—│| '):  # leer oder Trennlinie (inkl. Leerzeichen)
+            continue
+        parts = re.split(r'\s{2,}', s)
+        first = parts[0]
+        active = '◆' in first
+        name = first.replace('◆', '').strip()
+        if not name:
+            continue
+        profiles.append({
+            'name':   name,
+            'active': active,
+            'model':  parts[1] if len(parts) > 1 else '',
+        })
+    return profiles
+
+
+def send_hermes_profiles(cfg):
+    """Liest `hermes profile list` und schickt die Profile an den Server.
+    Wird via MQTT action=list-hermes-profiles ausgelöst (App: Profil-Auswahl)."""
+    profiles = []
+    try:
+        out = _hermes_run(cfg, ['profile', 'list'], timeout=30)
+        if out:
+            profiles = _parse_hermes_profiles_table(out)
+    except Exception as e:
+        log.error(f'send_hermes_profiles: {e}')
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_hermes_profiles.php',
+            json={'token_b': cfg['token_b'], 'profiles': profiles},
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        if data.get('status') == 'ok':
+            log.info(f'Hermes profiles sent ({len(profiles)})')
+        else:
+            log.error(f'send_hermes_profiles: server rejected (HTTP {r.status_code}): {data}')
+    except Exception as e:
+        log.error(f'send_hermes_profiles: post failed: {e}')
+
+
 # --- Dispatch (Backend anhand cli_command wählen) ---
 
 def _history_session_files(cfg):
@@ -1073,6 +1311,8 @@ def _history_session_files(cfg):
 
 
 def build_history_list(cfg):
+    if _is_hermes_cfg(cfg):
+        return _hermes_history_list(cfg)
     files, backend = _history_session_files(cfg)
     if backend is None:
         return []
@@ -1086,6 +1326,8 @@ def build_history_list(cfg):
 
 
 def build_history_detail(cfg, session_id):
+    if _is_hermes_cfg(cfg):
+        return _hermes_history_detail(cfg, session_id)
     files, backend = _history_session_files(cfg)
     if backend is None:
         return None
@@ -1126,6 +1368,9 @@ def delete_history_session(cfg, session_id):
     deleted = []
     if not session_id:
         errors.append('keine session_id übergeben')
+    elif _is_hermes_cfg(cfg):
+        # Hermes: keine Dateien — Löschen über `hermes sessions delete --yes <id>`.
+        deleted, errors = _hermes_delete_session(cfg, session_id)
     else:
         try:
             paths = build_history_delete_paths(cfg, session_id)
@@ -1295,6 +1540,8 @@ def on_message(client, userdata, msg):
         send_history_detail(cfg, payload.get('session_id', ''))
     elif action == 'delete-history-session':
         delete_history_session(cfg, payload.get('session_id', ''))
+    elif action == 'list-hermes-profiles':
+        send_hermes_profiles(cfg)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
