@@ -1271,22 +1271,31 @@ def _parse_hermes_sessions_table(text):
         title = parts[0] if parts and not re.match(r'\d{8}_\d{6}', parts[0]) else ''
         entries.append({
             'session_id':    sid,
-            'title':         title or 'Gespräch',
+            'title':         title,  # kann leer/Platzhalter sein — siehe _hermes_history_list
             'updated_at':    _hermes_sid_to_iso(sid),
             'message_count': 0,
         })
     return entries
 
 
+_HERMES_PLACEHOLDER_TITLE_RE = re.compile(r'^[\s\-–—_]*$')
+
+
 def _hermes_history_list(cfg):
     out = _hermes_run(cfg, ['sessions', 'list', '--limit', '200'], timeout=60)
     if out is None:
-        log.error('_hermes_history_list: hermes sessions list lieferte keine Ausgabe')
         return []
     entries = _parse_hermes_sessions_table(out)
-    first_line = out.splitlines()[0] if out.splitlines() else '(leer)'
-    log.info(f'_hermes_history_list DIAG: raw_len={len(out)} first_line={first_line!r} '
-             f'parsed_count={len(entries)} first_entry={entries[0] if entries else None!r}')
+    # Hermes zeigt für CLI-erzeugte One-Shot-Sessions oft nur einen Platzhalter
+    # (z.B. "—") statt eines echten Titels — dessen eigene Titel-Generierung greift
+    # anscheinend nur bei "richtigen" interaktiven Gesprächen. In dem Fall den
+    # Anfang der ersten echten Nutzer-Nachricht als Titel nachladen (ein Export
+    # pro betroffener Session — nur für Platzhalter-Titel, nicht für alle).
+    for entry in entries:
+        if _HERMES_PLACEHOLDER_TITLE_RE.match(entry['title']):
+            messages = _hermes_history_detail(cfg, entry['session_id'])
+            first_user = next((m['content'] for m in (messages or []) if m['role'] == 'user'), '')
+            entry['title'] = first_user[:60] if first_user else 'Gespräch'
     return entries
 
 
