@@ -497,6 +497,23 @@ def apply_nvm_path_fallback():
     log.info(f'nvm: höchste installierte Node-Version vorne an PATH gestellt: {bin_dir}')
 
 
+def apply_user_local_bin_path():
+    """Stellt ~/.local/bin an den PATH, falls vorhanden.
+
+    Als systemd-User-Service startet die Bridge ohne Login-Shell und damit ohne das
+    PATH aus dem Shell-Profil — ~/.local/bin (Standardziel von 'pip install --user',
+    dort liegt z.B. die hermes-CLI) fehlt dann. Ein bloßer Kommandoname wie 'hermes'
+    im cli_command ist sonst nicht auffindbar ("No such file or directory: 'hermes'"),
+    obwohl er in der interaktiven Shell einwandfrei funktioniert."""
+    bin_dir = str(Path.home() / '.local' / 'bin')
+    if not os.path.isdir(bin_dir):
+        return
+    path_parts = os.environ.get('PATH', '').split(os.pathsep)
+    if bin_dir not in path_parts:
+        os.environ['PATH'] = bin_dir + os.pathsep + os.environ.get('PATH', '')
+        log.info(f'~/.local/bin an PATH gestellt: {bin_dir}')
+
+
 # ─────────────────────────────────────────────
 # Hermes-Backend-Helfer
 # ─────────────────────────────────────────────
@@ -1755,6 +1772,7 @@ def main():
     cfg = load_config()
     apply_local_telegram_config(cfg)
     apply_nvm_path_fallback()
+    apply_user_local_bin_path()
 
     telegram_only = cfg.get('telegram_only', False)
     client = None
