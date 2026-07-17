@@ -50,8 +50,9 @@ log = logging.getLogger('ac_bridge')
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
-CONFIG_FILE          = Path(__file__).parent / 'config.json'
-TELEGRAM_CONFIG_FILE = Path(__file__).parent / 'telegram-config.json'
+CONFIG_FILE           = Path(__file__).parent / 'config.json'
+TELEGRAM_CONFIG_FILE  = Path(__file__).parent / 'telegram-config.json'
+HERMES_TITLE_CACHE_FILE = Path(__file__).parent / 'hermes_title_cache.json'
 TELEGRAM_CONFIG_KEYS = ('telegram_chat_id', 'telegram_bot_token', 'telegram_system_prompt')
 
 PROTECTED_CONFIG_KEYS = {
@@ -81,6 +82,26 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
+
+def load_hermes_title_cache():
+    """session_id -> abgeleiteter Titel. Vergangene Gespräche ändern sich nie
+    wieder — einmal aufgelöste Platzhalter-Titel (siehe _hermes_history_list)
+    müssen nicht bei jedem Verlauf-Tab-Öffnen erneut per Export ermittelt werden."""
+    if not HERMES_TITLE_CACHE_FILE.exists():
+        return {}
+    try:
+        with open(HERMES_TITLE_CACHE_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f'hermes_title_cache.json konnte nicht gelesen werden: {e}')
+        return {}
+
+def save_hermes_title_cache(cache):
+    try:
+        with open(HERMES_TITLE_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        log.error(f'hermes_title_cache.json konnte nicht geschrieben werden: {e}')
 
 def apply_local_telegram_config(cfg):
     """Prüft bei jedem Bridge-Start, ob telegram-config.json im Bridge-Verzeichnis
@@ -1289,13 +1310,31 @@ def _hermes_history_list(cfg):
     # Hermes zeigt für CLI-erzeugte One-Shot-Sessions oft nur einen Platzhalter
     # (z.B. "—") statt eines echten Titels — dessen eigene Titel-Generierung greift
     # anscheinend nur bei "richtigen" interaktiven Gesprächen. In dem Fall den
-    # Anfang der ersten echten Nutzer-Nachricht als Titel nachladen (ein Export
-    # pro betroffener Session — nur für Platzhalter-Titel, nicht für alle).
+    # Anfang der ersten echten Nutzer-Nachricht als Titel nachladen. Ein Export pro
+    # betroffener Session ist teuer (spürbar langsamer Verlauf-Tab bei vielen
+    # Sessions) — vergangene Gespräche ändern sich aber nie wieder, deshalb wird
+    # ein einmal aufgelöster Titel gecacht und nur für WIRKLICH neue Sessions
+    # (noch nicht im Cache) erneut ein Export gemacht.
+    cache = load_hermes_title_cache()
+    cache_dirty = False
     for entry in entries:
-        if _HERMES_PLACEHOLDER_TITLE_RE.match(entry['title']):
-            messages = _hermes_history_detail(cfg, entry['session_id'])
-            first_user = next((m['content'] for m in (messages or []) if m['role'] == 'user'), '')
-            entry['title'] = first_user[:60] if first_user else 'Gespräch'
+        if not _HERMES_PLACEHOLDER_TITLE_RE.match(entry['title']):
+            continue
+        sid = entry['session_id']
+        if sid in cache:
+            entry['title'] = cache[sid]
+            continue
+        messages = _hermes_history_detail(cfg, sid)
+        first_user = next((m['content'] for m in (messages or []) if m['role'] == 'user'), '')
+        resolved = first_user[:60] if first_user else 'Gespräch'
+        entry['title'] = resolved
+        # 'Gespräch' (kein first_user gefunden) nicht cachen — könnte ein
+        # vorübergehender Export-Fehler sein, beim nächsten Mal erneut versuchen.
+        if first_user:
+            cache[sid] = resolved
+            cache_dirty = True
+    if cache_dirty:
+        save_hermes_title_cache(cache)
     return entries
 
 
@@ -1339,6 +1378,12 @@ def _hermes_delete_session(cfg, session_id):
     out = _hermes_run(cfg, ['sessions', 'delete', '--yes', session_id], timeout=30)
     if out is None:
         return [], [f'hermes sessions delete für {session_id} fehlgeschlagen']
+    # Cache-Eintrag mit entfernen, sonst wächst hermes_title_cache.json unbegrenzt
+    # mit Titeln für längst gelöschte Sessions weiter.
+    cache = load_hermes_title_cache()
+    if session_id in cache:
+        del cache[session_id]
+        save_hermes_title_cache(cache)
     return [f'hermes session {session_id}'], []
 
 
