@@ -557,6 +557,47 @@ def _parse_hermes_output(raw):
 
 
 # ─────────────────────────────────────────────
+# System-Prompt-Injection (Backends ohne eigenes System-Prompt-Flag)
+# ─────────────────────────────────────────────
+# Openclaw und Hermes haben kein Per-Call-System-Prompt-Flag (bei Claude: --system-prompt).
+# Der System-Prompt wird dort dem eigentlichen Prompt vorangestellt und landet damit im
+# Gesprächsverlauf — bei fortsetzbaren Sessions (Hermes --resume) bliebe er sonst
+# scheinbar dauerhaft gültig. Die Einrahmung macht den Einmal-Charakter explizit.
+#
+# Die Marker sind zugleich eindeutige Trennzeichen fürs Wieder-Entfernen im Verlauf-Tab
+# (_strip_injected_system_prompt) — dadurch werden auch INDIVIDUELL angepasste
+# System-Prompts sauber erkannt, was mit dem alten Exact-Match-Verfahren nicht ging.
+# Frame und Strip werden bewusst aus denselben Konstanten gebaut, damit sie nicht
+# auseinanderlaufen können.
+_ONE_TIME_FRAME_MARKERS = {
+    'DE': ('[Hinweis: Die folgende Anweisung gilt NUR für diese eine Antwort, '
+           'nicht für künftige Nachrichten in diesem Gespräch]',
+           '[Ende der einmaligen Anweisung]'),
+    'EN': ('[Note: The following instruction applies ONLY to this one response, '
+           'not to future messages in this conversation]',
+           '[End of one-time instruction]'),
+}
+
+_ONE_TIME_FRAME_STRIP_RE = re.compile(
+    '|'.join(
+        re.escape(start) + r'\n.*?\n' + re.escape(end) + r'\n*'
+        for start, end in _ONE_TIME_FRAME_MARKERS.values()
+    ),
+    re.DOTALL,
+)
+
+
+def _frame_one_time_system_prompt(system_prompt, lang):
+    start, end = _ONE_TIME_FRAME_MARKERS.get(lang, _ONE_TIME_FRAME_MARKERS['EN'])
+    return f'{start}\n{system_prompt}\n{end}'
+
+
+def _strip_one_time_frame(text):
+    """Entfernt einen eingerahmten System-Prompt (beide Sprachen, auch angepasste)."""
+    return _ONE_TIME_FRAME_STRIP_RE.sub('', text, count=1).lstrip()
+
+
+# ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
 def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
@@ -627,8 +668,11 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
             log.info(f'Passing system prompt via param "{sp_param}" ({len(system_prompt)} chars): "{system_prompt[:120]}"')
             cmd += [sp_param, system_prompt]
         else:
-            log.info(f'No sp_param configured — prepending system prompt to prompt ({len(system_prompt)} chars): "{system_prompt[:120]}"')
-            prompt = f'{system_prompt}\n\n{prompt}' if prompt else system_prompt
+            # Kein System-Prompt-Flag (Openclaw/Hermes) → voranstellen, aber als
+            # einmalig gültig eingerahmt (siehe _frame_one_time_system_prompt).
+            framed = _frame_one_time_system_prompt(system_prompt, cfg.get('lang', 'DE'))
+            log.info(f'No sp_param configured — prepending framed (one-time) system prompt ({len(system_prompt)} chars): "{system_prompt[:120]}"')
+            prompt = f'{framed}\n\n{prompt}' if prompt else framed
     else:
         log.info('No system prompt passed to agent CLI.')
 
@@ -1013,14 +1057,15 @@ _OPENCLAW_METADATA_BLOCK_RE = re.compile(
 )
 
 # Standard-System-Prompts (siehe ios_app_endpoint.php $sp_chat/$sp_siri bzw.
-# L10n.defaultSystemPromptChat/Siri in der App) — bei Backends ohne eigenes
-# System-Prompt-CLI-Flag (aktueller Openclaw-Default, cli_system_prompt_param='')
-# hängt call_agent_cli() den System-Prompt direkt vor den Prompt:
-# f'{system_prompt}\n\n{prompt}'. Exaktes Matchen statt einer Heuristik, da die
-# Standard-Prompts selbst mehrere \n\n enthalten (ein simples "letzter Absatz"-
-# Split würde dort falsch schneiden). Individuell angepasste System-Prompts
-# werden nicht erkannt und bleiben unverändert (kein Rückschritt ggü. vorher).
-_OPENCLAW_KNOWN_SYSTEM_PROMPTS = (
+# L10n.defaultSystemPromptChat/Siri in der App).
+#
+# NUR noch für ALTBESTAND nötig: Sessions, die vor der Einrahmung (siehe
+# _frame_one_time_system_prompt) entstanden sind, enthalten den System-Prompt roh
+# vorangestellt. Dort hilft nur exaktes Matchen — individuell angepasste Prompts
+# werden in solchen Alt-Sessions nicht erkannt und bleiben stehen. Neue Sessions
+# sind eingerahmt und werden über die eindeutigen Marker sauber entfernt,
+# unabhängig davon, ob der Prompt angepasst wurde.
+_KNOWN_DEFAULT_SYSTEM_PROMPTS = (
     "Du bist ein hilfreicher Assistent. Deine Antworten werden per Text-Nachricht übermittelt.\nHalte dich an die folgenden Regeln:\n\n## Formatierung\nNutze gerne für die bessere Lesbarkeit in den Antworten übliche Markdown-Auszeichnungen.",
     "You are a helpful assistant. Your answers are delivered via text message.\nFollow these rules:\n\n## Formatting\nFeel free to use common Markdown formatting to improve readability.",
     "Du bist ein hilfreicher Sprachassistent. Deine Antworten werden per Text-to-Speech vorgelesen. Halte dich strikt an diese Regeln:\n\n## Antwortstil\n- Antworte in natürlicher, gesprochener Sprache — als würdest du mit jemandem reden, nicht schreiben.\n- Halte Antworten KURZ. Maximal 2–3 Sätze, außer es wird ausdrücklich mehr Detail verlangt.\n- Verwende kein Markdown: keine Aufzählungszeichen, keine Fettschrift, keine Überschriften, keine Listen, keine Codeblöcke.\n- Verwende keine Abkürzungen, die beim Vorlesen seltsam klingen. Schreibe \"zum Beispiel\" statt \"z.B.\".\n- Zahlen und Einheiten ausschreiben: \"drei Kilometer\" statt \"3 km\".\n- Keine Klammern, Schrägstriche oder Sonderzeichen.\n\n## Gesprächsstil\n- Komm direkt zum Punkt. Erst die Antwort, dann — wenn nötig — kurzer Kontext.\n- Bei mehrdeutigen Fragen: eine vernünftige Annahme treffen und kurz benennen.\n- Maximal eine Rückfrage stellen, und nur wenn sie wirklich nötig ist.\n- Aktionen mit kurzen, natürlichen Sätzen bestätigen: \"Erledigt, der Timer läuft.\" — nicht \"Ich habe die angeforderte Aktion erfolgreich ausgeführt.\"\n\n## Sprache\n- Immer auf Deutsch antworten, unabhängig von der Eingabe.\n- Warmer, gesprächiger Ton — nicht förmlich, nicht steif.\n\n## Grenzen\n- Wenn etwas nicht möglich ist: einen kurzen Satz, und wenn möglich eine Alternative anbieten.\n\n## Quellenangaben\n- Gebe die Quellen nur als Überschrift an\n- Gebe detaillierte Quellen wie URLs nur auf Rückfragen an",
@@ -1031,17 +1076,32 @@ _OPENCLAW_KNOWN_SYSTEM_PROMPTS = (
 _OPENCLAW_LEADING_TIMESTAMP_RE = re.compile(r'^\[[^\[\]]{1,60}\]\s*')
 
 
+def _strip_injected_system_prompt(text):
+    """Entfernt einen von uns injizierten System-Prompt am Textanfang — für den
+    Verlauf-Tab, damit dort die echte Nutzer-Nachricht steht und nicht der
+    vorangestellte System-Prompt. Gilt für alle Backends ohne System-Prompt-Flag
+    (Openclaw, Hermes).
+
+    Zwei Formate: aktuell eingerahmt (Marker eindeutig, erkennt auch angepasste
+    Prompts) und Altbestand ungerahmt (nur die Standard-Prompts erkennbar)."""
+    stripped = _strip_one_time_frame(text)
+    if stripped != text:
+        return stripped
+    for sp in _KNOWN_DEFAULT_SYSTEM_PROMPTS:
+        prefix = sp + '\n\n'
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
 def _openclaw_strip_system_prompt(text):
     # Manche Kanäle stellen der ganzen Nachricht (System-Prompt inklusive) einen
     # Zeitstempel wie "[Sat 2026-06-13 20:52 GMT+2] " voran.
     lead_match = _OPENCLAW_LEADING_TIMESTAMP_RE.match(text)
     lead = lead_match.group(0) if lead_match else ''
     body = text[len(lead):]
-    for sp in _OPENCLAW_KNOWN_SYSTEM_PROMPTS:
-        prefix = sp + '\n\n'
-        if body.startswith(prefix):
-            return body[len(prefix):]
-    return text
+    stripped = _strip_injected_system_prompt(body)
+    return stripped if stripped != body else text
 
 
 def _openclaw_extract_current_message(prompt_text):
@@ -1246,6 +1306,12 @@ def _hermes_history_detail(cfg, session_id):
             # Nur sichtbare Nutzer-/Agenten-Nachrichten. Raus: tool, session_meta,
             # leere assistant-Turns (nur tool_calls) und alle reasoning*-Felder.
             if role == 'user' and content:
+                # Von der Bridge erzeugte Sessions haben den System-Prompt vorangestellt
+                # (Hermes hat kein System-Prompt-Flag) — hier wieder entfernen, sonst
+                # stünde er im Verlauf statt der eigentlichen Nutzer-Nachricht.
+                content = _strip_injected_system_prompt(content).strip()
+                if not content:
+                    continue
                 messages.append({'role': 'user', 'content': content, 'timestamp': ts})
             elif role == 'assistant' and content:
                 messages.append({'role': 'agent', 'content': content, 'timestamp': ts})
