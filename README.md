@@ -72,8 +72,8 @@ The bridge receives the updated config via MQTT automatically.
 
 **AI agent instructions (copy-paste for your AI):**
 
-> Please install the AC Bridge on this machine:
-> 1. `git clone https://github.com/computeq-admin/ac-bridge.git`
+> Please install the AC Bridge in the home directory on this machine:
+> 1. `cd ~ && git clone https://github.com/computeq-admin/ac-bridge.git`
 > 2. `cd ac-bridge && chmod +x install.sh && ./install.sh`
 > 3. `python3 setup.py --get-token`
 >

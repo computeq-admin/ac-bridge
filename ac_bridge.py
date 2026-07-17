@@ -1280,7 +1280,14 @@ def _parse_hermes_sessions_table(text):
 
 def _hermes_history_list(cfg):
     out = _hermes_run(cfg, ['sessions', 'list', '--limit', '200'], timeout=60)
-    return _parse_hermes_sessions_table(out) if out is not None else []
+    if out is None:
+        log.error('_hermes_history_list: hermes sessions list lieferte keine Ausgabe')
+        return []
+    entries = _parse_hermes_sessions_table(out)
+    first_line = out.splitlines()[0] if out.splitlines() else '(leer)'
+    log.info(f'_hermes_history_list DIAG: raw_len={len(out)} first_line={first_line!r} '
+             f'parsed_count={len(entries)} first_entry={entries[0] if entries else None!r}')
+    return entries
 
 
 def _hermes_history_detail(cfg, session_id):
