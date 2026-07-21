@@ -794,6 +794,42 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
         return None, None
 
 
+def _safe_attachment_name(name, job_id):
+    """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
+    Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
+    damit wiederholte Uploads für denselben Job sich nicht überschreiben."""
+    base = os.path.basename(name or '').strip()
+    base = re.sub(r'[^\w.\- ]+', '_', base)
+    if not base or base in ('.', '..'):
+        base = 'anhang'
+    return f'ios_att_{job_id}_{time.strftime("%Y%m%d_%H%M%S")}_{base}'
+
+
+def download_attachment(cfg, job_id, attachment_token, attachment_name):
+    """Lädt den per Chunked-Upload zusammengesetzten Datei-Anhang eines Jobs vom
+    Server (download_attachment.php, token_b-Auth) und legt ihn unter session_files/
+    ab. Gibt den lokalen Pfad zurück oder None bei Fehler. Token-B rotiert hier NICHT
+    (Download-Response ist binär) — der get_job/put_answer-Zyklus rotiert ohnehin."""
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/download_attachment.php',
+            json={'token_b': cfg['token_b'], 'attachment_token': attachment_token},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            log.error(f'download_attachment: HTTP {r.status_code} für job #{job_id}: {r.text[:200]}')
+            return None
+        dest_dir = REPO_DIR / 'session_files'
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / _safe_attachment_name(attachment_name, job_id)
+        dest.write_bytes(r.content)
+        log.info(f'Attachment downloaded for job #{job_id}: {dest} ({len(r.content)} bytes)')
+        return str(dest)
+    except Exception as e:
+        log.error(f'download_attachment failed for job #{job_id}: {e}')
+        return None
+
+
 # ─────────────────────────────────────────────
 # Job processing
 # ─────────────────────────────────────────────
@@ -810,6 +846,8 @@ def process_wakeup(cfg):
     system_prompt = job.get('system_prompt', '')
     reset         = job.get('reset_history', True)
     image_data_b64 = job.get('image_data', '')
+    attachment_token = job.get('attachment_token', '')
+    attachment_name  = job.get('attachment_name', '')
     # App-gesteuertes Fortsetzen eines bestimmten (u.U. alten) Gesprächs: hat Vorrang
     # vor der RAM-gehaltenen Session. Leer bei Legacy-Jobs (Alexa/Siri/alte App) oder
     # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
@@ -847,6 +885,13 @@ def process_wakeup(cfg):
             log.info(f'Image decoded for job #{job_id}: {dest} ({len(image_bytes)} bytes)')
         except Exception as e:
             log.error(f'Image decode failed for job #{job_id}: {e}')
+
+    # Chunked-Upload-Anhang (neue App): Datei separat vom Server holen (umgeht das
+    # ~3 MB Webserver-Upload-Limit; der Download ist eine Response, unbegrenzt).
+    if attachment_token:
+        f = download_attachment(cfg, job_id, attachment_token, attachment_name)
+        if f:
+            downloaded_files.append(f)
 
     answer, new_session_id = call_agent_cli(
         cfg, prompt, system_prompt, files=downloaded_files or None,
