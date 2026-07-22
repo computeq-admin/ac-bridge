@@ -559,20 +559,37 @@ def _hermes_home_for(profile):
     return str(base / 'profiles' / p)
 
 
-def _parse_hermes_output(raw):
-    """Trennt Antworttext und Session-ID aus der Hermes -Q-Ausgabe.
+def _parse_hermes_output(raw, stderr=''):
+    """Trennt Antworttext und Session-ID aus der Hermes-Ausgabe.
+
+    WICHTIG: Hermes schreibt die "session_id:"-Zeile auf STDERR, nicht auf stdout
+    (empirisch verifiziert 2026-07-22: `hermes chat -q … -Q 2>/dev/null` liefert nur
+    den Antworttext, die session_id-Zeile erscheint ausschließlich auf stderr).
+    stdout enthält also bereits die reine Antwort. Der stdout-Fallback bleibt
+    erhalten, falls Hermes das Format später ändert.
+
     Rückgabe (answer, session_id); answer=None bei leerer Antwort."""
     sid = None
+    # 1) Primärquelle: stderr
     last = None
-    for last in _HERMES_SESSION_LINE_RE.finditer(raw):
-        pass  # letzte Übereinstimmung gewinnt (Trailer-Zeile)
+    for last in _HERMES_SESSION_LINE_RE.finditer(stderr or ''):
+        pass  # letzte Übereinstimmung gewinnt
     if last:
         sid = last.group(1)
-        answer = raw[:last.start()].strip()
-    else:
-        answer = raw.strip()
+
+    # 2) Fallback: stdout — dort muss die Zeile zusätzlich abgeschnitten werden.
+    answer = raw or ''
+    if sid is None:
+        last = None
+        for last in _HERMES_SESSION_LINE_RE.finditer(answer):
+            pass
+        if last:
+            sid = last.group(1)
+            answer = answer[:last.start()]
+
+    answer = answer.strip()
     if not answer:
-        log.error(f'Hermes output has no answer text: {raw[:200]}')
+        log.error(f'Hermes output has no answer text: {(raw or "")[:200]}')
         return None, None
     return answer, sid
 
@@ -755,8 +772,9 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
 
         extracted_sid = None
         if is_hermes:
-            # Hermes: zeilenbasiert (kein JSON) — Antwort + abschließende session_id-Zeile.
-            answer, extracted_sid = _parse_hermes_output(raw)
+            # Hermes: zeilenbasiert (kein JSON). Antwort steht auf stdout, die
+            # session_id-Zeile auf stderr — beides übergeben (siehe Funktions-Doku).
+            answer, extracted_sid = _parse_hermes_output(raw, result.stderr)
             if answer is None:
                 return None, None
             if extracted_sid:
