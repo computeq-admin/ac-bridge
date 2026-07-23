@@ -549,6 +549,14 @@ def _is_hermes_binary(cmd0):
     return 'hermes' in os.path.basename(cmd0)
 
 
+def _is_claude_binary(cmd0):
+    # Streaming (Phase 1) ist nur für die Claude-CLI implementiert (sauberes
+    # NDJSON über --output-format stream-json --verbose). Alle anderen Backends
+    # laufen weiter über den nicht-streamenden Pfad, auch wenn die App wants_stream
+    # setzt.
+    return 'claude' in os.path.basename(cmd0)
+
+
 def _hermes_home_for(profile):
     """Pfad zum Hermes-Home des gewählten Profils. Default-Profil liegt direkt in
     ~/.hermes, benannte Profile unter ~/.hermes/profiles/<name>."""
@@ -638,28 +646,18 @@ def _strip_one_time_frame(text):
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
-def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
-    """Ruft den KI-Agenten als lokalen CLI-Prozess auf.
+def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None):
+    """Baut die vollständige CLI-Kommandozeile (Session-, System-Prompt-, Datei- und
+    Extra-Parameter) für den konfigurierten Agenten. Gemeinsam genutzt vom
+    nicht-streamenden Pfad (call_agent_cli) und vom Streaming-Pfad
+    (call_agent_cli_streaming), damit die Kommandobildung nur an EINER Stelle lebt.
 
-    Session-Handling:
-      - session_id_override gesetzt (App will ein bestimmtes altes Gespräch fortsetzen):
-        hat Vorrang vor der RAM-gehaltenen _current_session_id für diesen einen Call.
-      - Sonst: kein _current_session_id → kein --resume, neuer Session-Start;
-               _current_session_id gesetzt → --resume <id> wird übergeben (Legacy-Verhalten
-               für Alexa/Siri/ältere App-Versionen, die keine session_id mitschicken).
-      - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert),
-        als neue _current_session_id übernehmen UND zurückgegeben (für put_answer).
-
-    files: optionale Liste lokaler Dateipfade die an den Agenten übergeben werden.
-      - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
-      - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
-
-    Rückgabe: (answer, session_id) — answer ist None bei Fehler; session_id ist die aus
-    dem Output extrahierte ID oder None (kein Feld konfiguriert / nicht vorhanden).
-    """
+    Rückgabe: (cmd, env, cwd, timeout, is_hermes) oder None bei fehlendem cli_command.
+    Nebenwirkung: der openclaw-„neue Session"-Zweig ruft store_session_id() (wie zuvor
+    innerhalb von call_agent_cli) — unverändertes Verhalten."""
     if not cfg.get('cli_command'):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
-        return None, None
+        return None
 
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
     is_hermes = _is_hermes_binary(cmd[0])
@@ -748,6 +746,33 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
     cwd     = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     timeout = cfg.get('cli_timeout', 600)
 
+    return cmd, env, cwd, timeout, is_hermes
+
+
+def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
+    """Ruft den KI-Agenten als lokalen CLI-Prozess auf.
+
+    Session-Handling:
+      - session_id_override gesetzt (App will ein bestimmtes altes Gespräch fortsetzen):
+        hat Vorrang vor der RAM-gehaltenen _current_session_id für diesen einen Call.
+      - Sonst: kein _current_session_id → kein --resume, neuer Session-Start;
+               _current_session_id gesetzt → --resume <id> wird übergeben (Legacy-Verhalten
+               für Alexa/Siri/ältere App-Versionen, die keine session_id mitschicken).
+      - Nach erfolgreichem Call: Session-ID aus JSON-Output extrahieren (wenn konfiguriert),
+        als neue _current_session_id übernehmen UND zurückgegeben (für put_answer).
+
+    files: optionale Liste lokaler Dateipfade die an den Agenten übergeben werden.
+      - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
+      - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
+
+    Rückgabe: (answer, session_id) — answer ist None bei Fehler; session_id ist die aus
+    dem Output extrahierte ID oder None (kein Feld konfiguriert / nicht vorhanden).
+    """
+    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override)
+    if built is None:
+        return None, None
+    cmd, env, cwd, timeout, is_hermes = built
+
     log.info(f'Calling CLI agent: {cmd[0]} (timeout={timeout}s, cwd={cwd})')
     try:
         result = subprocess.run(
@@ -812,6 +837,176 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
         return None, None
 
 
+def put_partial(cfg, job_id, partial):
+    """Schreibt eine Zwischenausgabe (wachsender Text) eines noch laufenden Jobs an
+    put_partial.php. Token-B wird bewusst NICHT rotiert (siehe put_partial.php) — die
+    Antwort enthält kein token_b_new, wir speichern nichts. Fire-and-forget: Fehler
+    werden nur geloggt, der Haupt-Job-Flow läuft davon unberührt weiter."""
+    try:
+        requests.post(
+            cfg['server_url'] + '/put_partial.php',
+            json={'token_b': cfg['token_b'], 'job_id': job_id, 'partial': partial},
+            timeout=5,
+        )
+    except Exception as e:
+        log.warning(f'put_partial failed for job #{job_id} (ignored): {e}')
+
+
+def _claude_stream_text_from_event(evt):
+    """Extrahiert sichtbaren Assistenten-Text aus einem Claude-stream-json-Event.
+    Nur 'assistant'-Message-Events mit text-Blöcken zählen; Tool-Nutzung etc. wird in
+    Phase 1 NICHT als Text gezeigt. Gibt '' zurück, wenn kein Text enthalten ist."""
+    if not isinstance(evt, dict) or evt.get('type') != 'assistant':
+        return ''
+    msg = evt.get('message') or {}
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return ''
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            parts.append(block.get('text') or '')
+    return ''.join(parts)
+
+
+def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
+                             session_id_override=None, on_partial=None):
+    """Streaming-Variante von call_agent_cli — NUR für die Claude-CLI (Phase 1).
+
+    Baut dasselbe Kommando wie der nicht-streamende Pfad (_build_agent_command),
+    stellt aber das Ausgabeformat auf '--output-format stream-json --verbose' um und
+    liest die NDJSON-Events zeilenweise per Popen. Für jedes 'assistant'-Text-Event
+    wächst der Zwischentext; on_partial(text) wird gedrosselt (~1,5 s) aufgerufen.
+
+    Die finale Antwort + session_id kommen aus der letzten '{"type":"result",...}'-Zeile
+    und werden EXAKT wie im nicht-streamenden Pfad ausgewertet (cli_answer_output_field /
+    cli_session_id_output_field). Rückgabe: (answer, session_id) — answer=None bei
+    Fehler, sodass der Aufrufer auf den nicht-streamenden Pfad zurückfallen kann.
+    """
+    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override)
+    if built is None:
+        return None, None
+    cmd, env, cwd, timeout, _is_hermes = built
+
+    # Ausgabeformat auf stream-json umstellen und --verbose erzwingen (stream-json OHNE
+    # --verbose lehnt die Claude-CLI ab). Ein vorhandenes '--output-format <x>' aus
+    # cli_extra_params wird ersetzt, sonst wird es angehängt.
+    new_cmd = []
+    i = 0
+    replaced = False
+    while i < len(cmd):
+        if cmd[i] == '--output-format' and i + 1 < len(cmd):
+            new_cmd += ['--output-format', 'stream-json']
+            i += 2
+            replaced = True
+            continue
+        new_cmd.append(cmd[i])
+        i += 1
+    if not replaced:
+        new_cmd += ['--output-format', 'stream-json']
+    if '--verbose' not in new_cmd:
+        new_cmd.append('--verbose')
+    cmd = new_cmd
+
+    answer_field     = cfg.get('cli_answer_output_field', 'result')
+    session_id_field = cfg.get('cli_session_id_output_field', '')
+
+    log.info(f'Calling CLI agent (streaming): {cmd[0]} (timeout={timeout}s, cwd={cwd})')
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env=env, cwd=cwd, bufsize=1,
+        )
+    except Exception as e:
+        log.error(f'streaming Popen failed: {e}')
+        return None, None
+
+    # Harte Zeitgrenze: ein Watchdog killt den Prozess nach timeout Sekunden. Das
+    # blockierende Lesen von stdout endet dann per EOF (kein Deadlock bei stummem CLI).
+    timed_out = {'v': False}
+    def _kill_on_timeout():
+        timed_out['v'] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    watchdog = threading.Timer(timeout, _kill_on_timeout)
+    watchdog.start()
+
+    accumulated   = ''
+    final_answer  = None
+    extracted_sid = None
+    last_post     = 0.0
+    last_posted   = None
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                # stream-json ist zeilenweise valides JSON; eine kaputte Zeile
+                # überspringen wir (kosmetisch), statt den Lauf abzubrechen.
+                continue
+
+            # Finale Ergebniszeile: exakt wie im nicht-streamenden Pfad auswerten.
+            if isinstance(evt, dict) and evt.get('type') == 'result':
+                if session_id_field:
+                    sid = json_get(evt, session_id_field) or ''
+                    if sid:
+                        extracted_sid = str(sid)
+                final_answer = (json_get(evt, answer_field) or '').strip()
+                continue
+
+            # Zwischentext: wachsenden Assistenten-Text sammeln + gedrosselt posten.
+            piece = _claude_stream_text_from_event(evt)
+            if piece:
+                accumulated += piece
+                now = time.monotonic()
+                if on_partial and accumulated != last_posted and (now - last_post) >= 1.5:
+                    on_partial(accumulated)
+                    last_post   = now
+                    last_posted = accumulated
+
+        proc.wait()
+    except Exception as e:
+        log.error(f'streaming read failed: {e}')
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None, None
+    finally:
+        watchdog.cancel()
+
+    if timed_out['v']:
+        log.error(f'streaming CLI timed out after {timeout}s')
+        return None, None
+
+    if proc.returncode not in (0, None):
+        log.error(f'streaming CLI exited {proc.returncode}')
+        return None, None
+
+    if not final_answer:
+        # Kein Ergebnis-Event → als Fehler behandeln, Aufrufer fällt zurück.
+        log.error('streaming CLI produced no result line')
+        return None, None
+
+    if extracted_sid:
+        store_session_id(extracted_sid)
+
+    # Vollständigen Text ein letztes Mal posten (nahtloser Übergang zur put_answer,
+    # die gleich darauf denselben Text final speichert).
+    if on_partial and accumulated and accumulated != last_posted:
+        on_partial(accumulated)
+
+    log.info(f'CLI answered via streaming ({len(final_answer)} chars)')
+    return final_answer, extracted_sid
+
+
 def _safe_attachment_name(name, job_id):
     """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
     Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
@@ -870,6 +1065,9 @@ def process_wakeup(cfg):
     # vor der RAM-gehaltenen Session. Leer bei Legacy-Jobs (Alexa/Siri/alte App) oder
     # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
     job_session_id = job.get('session_id') or None
+    # Streaming (Phase 1): nur wenn die App es angefordert hat UND die konfigurierte
+    # CLI die Claude-CLI ist (nur die streamt sauberes NDJSON). Sonst normaler Pfad.
+    wants_stream = bool(job.get('wants_stream')) and _is_claude_binary(_cli_binary(cfg))
 
     if not prompt or not job_id:
         log.warning('Job has no prompt or id, skipping.')
@@ -911,10 +1109,28 @@ def process_wakeup(cfg):
         if f:
             downloaded_files.append(f)
 
-    answer, new_session_id = call_agent_cli(
-        cfg, prompt, system_prompt, files=downloaded_files or None,
-        session_id_override=job_session_id,
-    )
+    if wants_stream:
+        # Streaming-Pfad: Zwischentext gedrosselt an put_partial.php schicken. Bei
+        # jedem Fehlschlag (kein Ergebnis, CLI-Fehler, Timeout) auf den bewährten
+        # nicht-streamenden Pfad zurückfallen, damit der Nutzer trotzdem eine Antwort
+        # bekommt — Streaming ist reines Zusatz-Komfort, kein kritischer Pfad.
+        log.info(f'Job #{job_id}: streaming enabled (Claude)')
+        answer, new_session_id = call_agent_cli_streaming(
+            cfg, prompt, system_prompt, files=downloaded_files or None,
+            session_id_override=job_session_id,
+            on_partial=lambda text: put_partial(cfg, job_id, text),
+        )
+        if answer is None:
+            log.warning(f'Job #{job_id}: streaming failed — falling back to non-streaming run.')
+            answer, new_session_id = call_agent_cli(
+                cfg, prompt, system_prompt, files=downloaded_files or None,
+                session_id_override=job_session_id,
+            )
+    else:
+        answer, new_session_id = call_agent_cli(
+            cfg, prompt, system_prompt, files=downloaded_files or None,
+            session_id_override=job_session_id,
+        )
 
     if answer:
         put_answer(cfg, job_id, answer, session_id=new_session_id)
