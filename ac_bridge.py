@@ -821,6 +821,10 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
     if built is None:
         return None, None
     cmd, env, cwd, timeout, is_hermes = built
+    # _build_agent_command berechnet session_id_field nur für seinen eigenen internen
+    # Gebrauch (Resume-Entscheidung) und gibt es nicht zurück — hier unten aber für die
+    # JSON-Antwort-Auswertung erneut benötigt. Reiner cfg-Read, keine Nebenwirkung.
+    session_id_field = cfg.get('cli_session_id_output_field', '')
 
     log.info(f'Calling CLI agent: {cmd[0]} (timeout={timeout}s, cwd={cwd})')
     try:
