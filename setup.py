@@ -430,9 +430,8 @@ def cmd_telegram_only():
     cfg.setdefault('cli_session_id_output_field',  'session_id')
     cfg.setdefault('cli_answer_output_field',      'result')
     cfg.setdefault('cli_timeout',                  600)
-    # --output-format verwaltet die Bridge jetzt selbst (_build_agent_command) — leer
-    # lassen. Für headless-Betrieb ohne TTY-Bestätigung ggf. selbst
-    # --dangerously-skip-permissions eintragen.
+    # --output-format UND --dangerously-skip-permissions verwaltet die Bridge jetzt
+    # selbst (_build_agent_command) — leer lassen, nur für echte Sonderfälle nutzen.
     cfg.setdefault('cli_extra_params',             '')
     cfg.setdefault('cli_file_param',               '')
     cfg.setdefault('cli_env',                      {})

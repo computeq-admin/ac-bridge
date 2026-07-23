@@ -97,9 +97,10 @@ This walks you through an interactive setup that asks for:
 - Optional: custom system prompt
 
 All Claude CLI parameters are pre-filled with sensible defaults (`--resume` for
-session continuity, etc.). `--output-format` is managed by the bridge itself,
-not by extra params — add flags like `--dangerously-skip-permissions` there
-yourself if you need headless/no-TTY operation. The service is installed and
+session continuity, etc.). `--output-format` and `--dangerously-skip-permissions`
+are managed by the bridge itself (required for headless/no-TTY operation) —
+extra params stays empty, only for genuine special cases (e.g. `--mcp-config`).
+The service is installed and
 started at the end.
 
 The service name will be `ac_bridge_tg-<username>-<install-dir>` (the install

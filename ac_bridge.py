@@ -646,15 +646,16 @@ def _strip_one_time_frame(text):
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
-# Output-Format-Flags, die die Bridge für Claude jetzt SELBST verwaltet (siehe
-# _build_agent_command). Ein Wert aus einer älteren, noch gespeicherten
-# cli_extra_params-Konfiguration (z.B. "--output-format json --dangerously-skip-permissions"
-# aus dem alten Preset-Default) wird beim Zusammenbauen herausgefiltert, statt doppelt
-# oder widersprüchlich neben dem bridge-eigenen Wert zu landen. Alles andere in
-# cli_extra_params (MCP-Flags wie --mcp-config, --dangerously-skip-permissions,
-# --allowedTools, …) bleibt unverändert erhalten — nur diese beiden Namen werden erkannt.
+# Flags, die die Bridge für Claude jetzt SELBST verwaltet (siehe _build_agent_command):
+# Output-Format UND --dangerously-skip-permissions (zwingend für headless Betrieb ohne
+# TTY — sonst hängt die CLI bei jedem Permission-Prompt, z.B. bei Tool-/MCP-Nutzung).
+# Ein Wert aus einer älteren, noch gespeicherten cli_extra_params-Konfiguration (z.B.
+# "--output-format json --dangerously-skip-permissions" aus dem alten Preset-Default)
+# wird beim Zusammenbauen herausgefiltert, statt doppelt oder widersprüchlich neben dem
+# bridge-eigenen Wert zu landen. Alles andere in cli_extra_params (z.B. --mcp-config,
+# --allowedTools) bleibt unverändert erhalten — nur diese Namen werden erkannt.
 _CLAUDE_MANAGED_FLAGS_WITH_VALUE = {'--output-format'}
-_CLAUDE_MANAGED_FLAGS_BARE       = {'--verbose', '--include-partial-messages'}
+_CLAUDE_MANAGED_FLAGS_BARE       = {'--verbose', '--include-partial-messages', '--dangerously-skip-permissions'}
 
 
 def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None,
@@ -757,12 +758,15 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         cmd.append(os.path.expanduser(arg))
 
     if is_claude:
-        # Bridge-verwaltetes Output-Format — siehe Modul-Kommentar oben. Nur Claude
-        # kennt dieses Flag; openclaw/hermes bleiben unangetastet (kein is_claude-Zweig).
+        # Bridge-verwaltetes Output-Format + Permission-Skip — siehe Modul-Kommentar
+        # oben. Nur Claude kennt diese Flags; openclaw/hermes bleiben unangetastet
+        # (kein is_claude-Zweig). --dangerously-skip-permissions unabhängig vom
+        # Streaming-Modus, da headless immer nötig.
         if streaming:
             cmd += ['--output-format', 'stream-json', '--verbose', '--include-partial-messages']
         else:
             cmd += ['--output-format', 'json']
+        cmd.append('--dangerously-skip-permissions')
 
     # Dateianhänge einbauen
     file_param = cfg.get('cli_file_param', '')
