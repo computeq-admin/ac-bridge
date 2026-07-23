@@ -646,11 +646,32 @@ def _strip_one_time_frame(text):
 # ─────────────────────────────────────────────
 # Agent call (CLI)
 # ─────────────────────────────────────────────
-def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None):
+# Output-Format-Flags, die die Bridge für Claude jetzt SELBST verwaltet (siehe
+# _build_agent_command). Ein Wert aus einer älteren, noch gespeicherten
+# cli_extra_params-Konfiguration (z.B. "--output-format json --dangerously-skip-permissions"
+# aus dem alten Preset-Default) wird beim Zusammenbauen herausgefiltert, statt doppelt
+# oder widersprüchlich neben dem bridge-eigenen Wert zu landen. Alles andere in
+# cli_extra_params (MCP-Flags wie --mcp-config, --dangerously-skip-permissions,
+# --allowedTools, …) bleibt unverändert erhalten — nur diese beiden Namen werden erkannt.
+_CLAUDE_MANAGED_FLAGS_WITH_VALUE = {'--output-format'}
+_CLAUDE_MANAGED_FLAGS_BARE       = {'--verbose', '--include-partial-messages'}
+
+
+def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None,
+                          streaming=False):
     """Baut die vollständige CLI-Kommandozeile (Session-, System-Prompt-, Datei- und
     Extra-Parameter) für den konfigurierten Agenten. Gemeinsam genutzt vom
     nicht-streamenden Pfad (call_agent_cli) und vom Streaming-Pfad
     (call_agent_cli_streaming), damit die Kommandobildung nur an EINER Stelle lebt.
+
+    Für die Claude-CLI verwaltet die Bridge das Output-Format jetzt SELBST (json bzw.
+    stream-json+verbose+include-partial-messages je nach `streaming`) — das Feld
+    "Extra-Parameter" ist dafür nicht mehr zuständig (neuer Default: leer). Alte,
+    bereits gespeicherte cli_extra_params mit "--output-format ..."/"--verbose"/
+    "--include-partial-messages" werden beim Bauen herausgefiltert (Rückwärtskompatibilität —
+    kein Doppel-Flag, kein Widerspruch), alles andere (z.B. MCP-relevante Flags) bleibt
+    unverändert. Andere Backends (openclaw/hermes) sind von dieser Verwaltung NICHT
+    betroffen — ihre cli_extra_params laufen unangetastet durch wie bisher.
 
     Rückgabe: (cmd, env, cwd, timeout, is_hermes) oder None bei fehlendem cli_command.
     Nebenwirkung: der openclaw-„neue Session"-Zweig ruft store_session_id() (wie zuvor
@@ -661,6 +682,7 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
     is_hermes = _is_hermes_binary(cmd[0])
+    is_claude = _is_claude_binary(cmd[0])
 
     # Session-Handling
     session_param    = cfg.get('cli_session_id_param', '')
@@ -712,8 +734,35 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
     else:
         log.info('No system prompt passed to agent CLI.')
 
-    for arg in shlex.split(cfg.get('cli_extra_params', '')):
+    extra_args = shlex.split(cfg.get('cli_extra_params', ''))
+    if is_claude:
+        # Rückwärtskompatibilität: von der Bridge verwaltete Flags aus einer alten
+        # Konfiguration herausfiltern (siehe Modul-Kommentar oben). Alles andere
+        # (MCP-relevante Flags etc.) bleibt erhalten.
+        filtered = []
+        i = 0
+        while i < len(extra_args):
+            arg = extra_args[i]
+            if arg in _CLAUDE_MANAGED_FLAGS_WITH_VALUE:
+                i += 2   # Flag + zugehöriger Wert überspringen
+                continue
+            if arg in _CLAUDE_MANAGED_FLAGS_BARE:
+                i += 1
+                continue
+            filtered.append(arg)
+            i += 1
+        extra_args = filtered
+
+    for arg in extra_args:
         cmd.append(os.path.expanduser(arg))
+
+    if is_claude:
+        # Bridge-verwaltetes Output-Format — siehe Modul-Kommentar oben. Nur Claude
+        # kennt dieses Flag; openclaw/hermes bleiben unangetastet (kein is_claude-Zweig).
+        if streaming:
+            cmd += ['--output-format', 'stream-json', '--verbose', '--include-partial-messages']
+        else:
+            cmd += ['--output-format', 'json']
 
     # Dateianhänge einbauen
     file_param = cfg.get('cli_file_param', '')
@@ -852,61 +901,38 @@ def put_partial(cfg, job_id, partial):
         log.warning(f'put_partial failed for job #{job_id} (ignored): {e}')
 
 
-def _claude_stream_text_from_event(evt):
-    """Extrahiert sichtbaren Assistenten-Text aus einem Claude-stream-json-Event.
-    Nur 'assistant'-Message-Events mit text-Blöcken zählen; Tool-Nutzung etc. wird in
-    Phase 1 NICHT als Text gezeigt. Gibt '' zurück, wenn kein Text enthalten ist."""
-    if not isinstance(evt, dict) or evt.get('type') != 'assistant':
-        return ''
-    msg = evt.get('message') or {}
-    content = msg.get('content')
-    if not isinstance(content, list):
-        return ''
-    parts = []
-    for block in content:
-        if isinstance(block, dict) and block.get('type') == 'text':
-            parts.append(block.get('text') or '')
-    return ''.join(parts)
-
-
 def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
                              session_id_override=None, on_partial=None):
     """Streaming-Variante von call_agent_cli — NUR für die Claude-CLI (Phase 1).
 
     Baut dasselbe Kommando wie der nicht-streamende Pfad (_build_agent_command),
-    stellt aber das Ausgabeformat auf '--output-format stream-json --verbose' um und
-    liest die NDJSON-Events zeilenweise per Popen. Für jedes 'assistant'-Text-Event
-    wächst der Zwischentext; on_partial(text) wird gedrosselt (~1,5 s) aufgerufen.
+    stellt aber das Ausgabeformat auf '--output-format stream-json --verbose
+    --include-partial-messages' um und liest die NDJSON-Events zeilenweise per Popen.
 
-    Die finale Antwort + session_id kommen aus der letzten '{"type":"result",...}'-Zeile
-    und werden EXAKT wie im nicht-streamenden Pfad ausgewertet (cli_answer_output_field /
-    cli_session_id_output_field). Rückgabe: (answer, session_id) — answer=None bei
-    Fehler, sodass der Aufrufer auf den nicht-streamenden Pfad zurückfallen kann.
+    WICHTIG (2026-07-23, nach erstem Live-Test korrigiert): OHNE
+    --include-partial-messages liefert die Claude-CLI pro Gesprächsrunde nur EINE
+    komplette Assistant-Message (kein Zeichen-für-Zeichen-Wachstum) — bei
+    MCP-Tool-Nutzung sind die Zwischen-Nachrichten zudem meist reine tool_use-Blöcke
+    ohne Text. Mit dem Flag kommen zusätzlich 'stream_event'-Zeilen mit
+    content_block_delta/text_delta — das sind die tatsächlich wachsenden
+    Textstücke, die hier akkumuliert werden. on_partial(text) wird gedrosselt (~1,5s)
+    aufgerufen.
+
+    Die finale Antwort + session_id kommen weiterhin aus der letzten
+    '{"type":"result",...}'-Zeile, exakt wie im nicht-streamenden Pfad ausgewertet
+    (cli_answer_output_field / cli_session_id_output_field) — unverändert von diesem
+    Fix. Rückgabe: (answer, session_id) — answer=None bei Fehler, sodass der Aufrufer
+    auf den nicht-streamenden Pfad zurückfallen kann.
     """
-    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override)
+    # streaming=True: _build_agent_command hängt selbst die passenden Flags an
+    # (--output-format stream-json --verbose --include-partial-messages) und filtert
+    # eine ggf. noch gespeicherte alte "--output-format json"-Konfiguration heraus —
+    # siehe Modul-Kommentar bei _CLAUDE_MANAGED_FLAGS_WITH_VALUE.
+    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override,
+                                  streaming=True)
     if built is None:
         return None, None
     cmd, env, cwd, timeout, _is_hermes = built
-
-    # Ausgabeformat auf stream-json umstellen und --verbose erzwingen (stream-json OHNE
-    # --verbose lehnt die Claude-CLI ab). Ein vorhandenes '--output-format <x>' aus
-    # cli_extra_params wird ersetzt, sonst wird es angehängt.
-    new_cmd = []
-    i = 0
-    replaced = False
-    while i < len(cmd):
-        if cmd[i] == '--output-format' and i + 1 < len(cmd):
-            new_cmd += ['--output-format', 'stream-json']
-            i += 2
-            replaced = True
-            continue
-        new_cmd.append(cmd[i])
-        i += 1
-    if not replaced:
-        new_cmd += ['--output-format', 'stream-json']
-    if '--verbose' not in new_cmd:
-        new_cmd.append('--verbose')
-    cmd = new_cmd
 
     answer_field     = cfg.get('cli_answer_output_field', 'result')
     session_id_field = cfg.get('cli_session_id_output_field', '')
@@ -961,12 +987,24 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
                 final_answer = (json_get(evt, answer_field) or '').strip()
                 continue
 
-            # Zwischentext: wachsenden Assistenten-Text sammeln + gedrosselt posten.
-            piece = _claude_stream_text_from_event(evt)
+            # Zwischentext: NUR die 'stream_event'/content_block_delta/text_delta-Zeilen
+            # tragen tatsächlich wachsenden Text (siehe Docstring). Komplette
+            # 'assistant'-Messages werden hier bewusst NICHT zusätzlich ausgewertet —
+            # das würde denselben Text doppelt anhängen, da er bereits Delta für Delta
+            # hereinkam.
+            if not isinstance(evt, dict) or evt.get('type') != 'stream_event':
+                continue
+            inner = evt.get('event') or {}
+            if not isinstance(inner, dict) or inner.get('type') != 'content_block_delta':
+                continue
+            delta = inner.get('delta') or {}
+            if not isinstance(delta, dict) or delta.get('type') != 'text_delta':
+                continue
+            piece = delta.get('text') or ''
             if piece:
                 accumulated += piece
                 now = time.monotonic()
-                if on_partial and accumulated != last_posted and (now - last_post) >= 1.5:
+                if on_partial and (now - last_post) >= 1.5:
                     on_partial(accumulated)
                     last_post   = now
                     last_posted = accumulated
