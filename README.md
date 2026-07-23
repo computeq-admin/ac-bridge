@@ -96,9 +96,11 @@ This walks you through an interactive setup that asks for:
 - Telegram chat ID (your user ID — see below)
 - Optional: custom system prompt
 
-All Claude CLI parameters are pre-filled with sensible defaults
-(`--output-format json --dangerously-skip-permissions`, `--resume` for session
-continuity, etc.). The service is installed and started at the end.
+All Claude CLI parameters are pre-filled with sensible defaults (`--resume` for
+session continuity, etc.). `--output-format` is managed by the bridge itself,
+not by extra params — add flags like `--dangerously-skip-permissions` there
+yourself if you need headless/no-TTY operation. The service is installed and
+started at the end.
 
 The service name will be `ac_bridge_tg-<username>-<install-dir>` (the install
 directory is included so multiple installs for the same username don't collide).
