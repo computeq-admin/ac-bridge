@@ -557,6 +557,10 @@ def _is_claude_binary(cmd0):
     return 'claude' in os.path.basename(cmd0)
 
 
+def _is_openclaw_binary(cmd0):
+    return 'openclaw' in os.path.basename(cmd0)
+
+
 def _hermes_home_for(profile):
     """Pfad zum Hermes-Home des gewählten Profils. Default-Profil liegt direkt in
     ~/.hermes, benannte Profile unter ~/.hermes/profiles/<name>."""
@@ -657,6 +661,17 @@ def _strip_one_time_frame(text):
 _CLAUDE_MANAGED_FLAGS_WITH_VALUE = {'--output-format'}
 _CLAUDE_MANAGED_FLAGS_BARE       = {'--verbose', '--include-partial-messages', '--dangerously-skip-permissions'}
 
+# Gleiches Prinzip (2026-07-24) jetzt auch für Hermes und OpenClaw: beide brauchen
+# ihre "Standard"-Flags zwingend für headless Betrieb (kein optionales Extra), die
+# Bridge hängt sie deshalb selbst an. cli_extra_params ist bei beiden Backends jetzt
+# ebenfalls standardmäßig leer, nur für echte Sonderfälle gedacht.
+# Hermes: -Q (ruhige/nicht-TUI-Ausgabe, nötig für sauberes stdout-Parsing),
+#         --yolo (Tool-Permissions ohne Rückfrage), --accept-hooks (Hooks ohne Rückfrage).
+_HERMES_MANAGED_FLAGS_BARE = {'-Q', '--yolo', '--accept-hooks'}
+# OpenClaw: --json ist zwingend für die JSON-basierte Antwort-/Session-ID-Auswertung
+# in call_agent_cli (cli_answer_output_field nutzt Dot-Notation auf JSON).
+_OPENCLAW_MANAGED_FLAGS_BARE = {'--json'}
+
 
 def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None,
                           streaming=False):
@@ -684,6 +699,7 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
     cmd = shlex.split(os.path.expanduser(cfg['cli_command']))
     is_hermes = _is_hermes_binary(cmd[0])
     is_claude = _is_claude_binary(cmd[0])
+    is_openclaw = _is_openclaw_binary(cmd[0])
 
     # Session-Handling
     session_param    = cfg.get('cli_session_id_param', '')
@@ -735,8 +751,19 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
     else:
         log.info('No system prompt passed to agent CLI.')
 
-    extra_args = shlex.split(cfg.get('cli_extra_params', ''))
+    # Von der Bridge verwaltete Flags des jeweiligen Backends bestimmen (leere Sets
+    # für alle anderen Backends — deren cli_extra_params bleibt komplett unangetastet).
     if is_claude:
+        managed_with_value, managed_bare = _CLAUDE_MANAGED_FLAGS_WITH_VALUE, _CLAUDE_MANAGED_FLAGS_BARE
+    elif is_hermes:
+        managed_with_value, managed_bare = set(), _HERMES_MANAGED_FLAGS_BARE
+    elif is_openclaw:
+        managed_with_value, managed_bare = set(), _OPENCLAW_MANAGED_FLAGS_BARE
+    else:
+        managed_with_value, managed_bare = set(), set()
+
+    extra_args = shlex.split(cfg.get('cli_extra_params', ''))
+    if managed_with_value or managed_bare:
         # Rückwärtskompatibilität: von der Bridge verwaltete Flags aus einer alten
         # Konfiguration herausfiltern (siehe Modul-Kommentar oben). Alles andere
         # (MCP-relevante Flags etc.) bleibt erhalten.
@@ -744,10 +771,10 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         i = 0
         while i < len(extra_args):
             arg = extra_args[i]
-            if arg in _CLAUDE_MANAGED_FLAGS_WITH_VALUE:
+            if arg in managed_with_value:
                 i += 2   # Flag + zugehöriger Wert überspringen
                 continue
-            if arg in _CLAUDE_MANAGED_FLAGS_BARE:
+            if arg in managed_bare:
                 i += 1
                 continue
             filtered.append(arg)
@@ -767,6 +794,13 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         else:
             cmd += ['--output-format', 'json']
         cmd.append('--dangerously-skip-permissions')
+    elif is_hermes:
+        # Bridge-verwaltete Standard-Flags — siehe Modul-Kommentar oben. `streaming`
+        # ändert hier (noch) nichts; Hermes-Streaming ist ein separates, späteres
+        # Vorhaben über den Hermes-API-Server, nicht über diesen CLI-Aufruf.
+        cmd += ['-Q', '--yolo', '--accept-hooks']
+    elif is_openclaw:
+        cmd.append('--json')
 
     # Dateianhänge einbauen
     file_param = cfg.get('cli_file_param', '')
