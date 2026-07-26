@@ -1145,17 +1145,21 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
     CLI-Subprozess, sondern ein einzelner HTTP-Call an /v1/chat/completions mit
     stream=true.
 
-    WICHTIG (2026-07-25): Noch NICHT live gegen eine echte Instanz verifiziert —
-    folgt dem dokumentierten/angenommenen OpenAI-Chat-Completions-SSE-Format
-    ("data: {...}"-Frames, choices[0].delta.content, abschließend "data: [DONE]")
-    und einem angenommenen X-Hermes-Session-Id-Header für Session-Kontinuität.
+    Live verifiziert 2026-07-26 gegen eine echte Instanz (Kalender-MCP-Nutzung):
+    OpenAI-Chat-Completions-SSE-Format ("data: {...}"-Frames, choices[0].delta.
+    content, abschließend "data: [DONE]") bestätigt, ebenso der
+    X-Hermes-Session-Id-Response-Header für Session-Kontinuität (Log zeigte
+    "Session ID stored: api-..."). Zusätzlich bestätigt: Tool-Nutzung sendet
+    "choices"-lose Events {"tool","emoji"?,"label"?,"toolCallId","status":
+    "running"|"completed"} — nur "running" wird als kosmetischer Fortschritt
+    gezeigt (siehe unten im Code), "completed" käme oft <1s später und würde nur
+    flackern. NICHT verifiziert: ob eine native system-Rolle wirklich beachtet
+    wird (kein Log-Beweis dafür/dagegen).
+
     Bei JEDEM Fehler (Verbindung, HTTP-Fehlercode, kaputtes/unerwartetes Format,
     kein Text erhalten) gibt diese Funktion (None, None) zurück — der Aufrufer
     (process_wakeup) fällt dann auf den bewährten CLI-Pfad (call_agent_cli) zurück,
-    exakt wie beim Claude-Streaming. Das fängt harte Fehlschläge ab; ein *falsch*
-    aber fehlerfrei beantworteter Request (z.B. System-Prompt wird vom Server
-    stillschweigend ignoriert) würde davon NICHT erkannt — das lässt sich nur durch
-    einen echten Test gegen eine aktive Instanz verifizieren.
+    exakt wie beim Claude-Streaming.
 
     Rückgabe: (answer, session_id) — answer=None bei Fehler.
     """
@@ -1210,12 +1214,23 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
 
                 choices = evt.get('choices') or []
                 if not choices:
-                    # Diagnose (2026-07-25): jedes Event ohne "choices" wird geloggt
-                    # statt stillschweigend übersprungen — vermutlich Tool-Progress
-                    # o.ä. (siehe hermes.tool.progress aus der Recherche). Format noch
-                    # nicht live gesehen; sobald sichtbar, hier gezielt auswerten statt
-                    # zu raten.
-                    log.info(f'Hermes SSE event ohne choices (Format-Diagnose): {payload[:300]}')
+                    # Tool-Progress-Event — live verifiziert 2026-07-26 gegen eine
+                    # echte Instanz (Kalender-MCP-Aufruf): {"tool": "...",
+                    # "emoji"?: "...", "label"?: "...", "toolCallId": "...",
+                    # "status": "running"|"completed"}. Nur "running" anzeigen (nicht
+                    # "completed" zusätzlich — die Paare kommen oft <1s auseinander,
+                    # das würde nur flackern). Bewusst NICHT in "accumulated"
+                    # aufgenommen — das ist kein Teil der finalen Antwort.
+                    if evt.get('tool') and evt.get('status') == 'running':
+                        if on_partial:
+                            emoji = evt.get('emoji', '')
+                            label = evt.get('label') or evt.get('tool')
+                            status_line = f'{emoji} {label} …'.strip()
+                            on_partial(status_line)
+                            last_posted = status_line
+                    else:
+                        # Alles andere Unbekannte weiter loggen statt zu raten.
+                        log.info(f'Hermes SSE event ohne choices (Format-Diagnose): {payload[:300]}')
                     continue
                 piece = (choices[0].get('delta') or {}).get('content') or ''
                 if piece:
