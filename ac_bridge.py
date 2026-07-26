@@ -1016,6 +1016,14 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
     (cli_answer_output_field / cli_session_id_output_field) — unverändert von diesem
     Fix. Rückgabe: (answer, session_id) — answer=None bei Fehler, sodass der Aufrufer
     auf den nicht-streamenden Pfad zurückfallen kann.
+
+    Tool-Nutzung (2026-07-26, analog zur Hermes-Tool-Progress-Anzeige): bei
+    content_block_start mit content_block.type=="tool_use" wird eine kosmetische
+    "🔧 <Tool-Name> …"-Statuszeile über on_partial gesendet (dokumentiertes
+    Anthropic-Format, aber NICHT live gegen Claude Code CLI verifiziert). Jeder
+    andere, noch unbekannte stream_event-Typ wird geloggt statt stillschweigend
+    verworfen — falls Claude Code CLI ein eigenes Tool-Ergebnis-Event hat, taucht es
+    dort auf.
     """
     # streaming=True: _build_agent_command hängt selbst die passenden Flags an
     # (--output-format stream-json --verbose --include-partial-messages) und filtert
@@ -1088,8 +1096,35 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
             if not isinstance(evt, dict) or evt.get('type') != 'stream_event':
                 continue
             inner = evt.get('event') or {}
-            if not isinstance(inner, dict) or inner.get('type') != 'content_block_delta':
+            if not isinstance(inner, dict):
                 continue
+            inner_type = inner.get('type')
+
+            # Tool-Nutzung ankündigen (2026-07-26, analog zur Hermes-Tool-Progress-
+            # Anzeige): content_block_start mit content_block.type=="tool_use" ist
+            # dokumentiertes Anthropic-Streaming-Format und enthält den Tool-Namen
+            # direkt. NICHT live gegen Claude Code CLI verifiziert (die Doku gilt für
+            # die rohe Messages-API — Claude Code könnte zusätzlich wrappen), daher
+            # defensiv geprüft und ohne Crash-Risiko bei abweichendem Format.
+            if inner_type == 'content_block_start':
+                block = inner.get('content_block') or {}
+                if isinstance(block, dict) and block.get('type') == 'tool_use' and on_partial:
+                    tool_name = block.get('name') or 'Tool'
+                    status_line = f'🔧 {tool_name} …'
+                    on_partial(status_line)
+                    last_posted = status_line
+                continue
+
+            if inner_type != 'content_block_delta':
+                # Bekannte, aber für uns uninteressante Strukturereignisse still
+                # überspringen; alles WEITERE unbekannte loggen statt zu raten —
+                # falls Claude Code CLI ein eigenes Tool-Ergebnis-Event hat, taucht
+                # es hier auf und kann beim nächsten Live-Test ausgewertet werden.
+                if inner_type not in ('message_start', 'message_delta', 'message_stop',
+                                      'content_block_stop'):
+                    log.info(f'Claude stream_event unbekannter Typ (Format-Diagnose): {inner_type}')
+                continue
+
             delta = inner.get('delta') or {}
             if not isinstance(delta, dict) or delta.get('type') != 'text_delta':
                 continue
