@@ -1210,6 +1210,12 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
 
                 choices = evt.get('choices') or []
                 if not choices:
+                    # Diagnose (2026-07-25): jedes Event ohne "choices" wird geloggt
+                    # statt stillschweigend übersprungen — vermutlich Tool-Progress
+                    # o.ä. (siehe hermes.tool.progress aus der Recherche). Format noch
+                    # nicht live gesehen; sobald sichtbar, hier gezielt auswerten statt
+                    # zu raten.
+                    log.info(f'Hermes SSE event ohne choices (Format-Diagnose): {payload[:300]}')
                     continue
                 piece = (choices[0].get('delta') or {}).get('content') or ''
                 if piece:
