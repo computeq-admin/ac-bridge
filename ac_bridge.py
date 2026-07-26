@@ -571,6 +571,57 @@ def _hermes_home_for(profile):
     return str(base / 'profiles' / p)
 
 
+def _hermes_api_server_config(cfg):
+    """Liest API_SERVER_*-Variablen aus der .env des aktiven Hermes-Profils
+    (Aktivierung laut Hermes-Doku: API_SERVER_ENABLED=true, _HOST, _PORT, _KEY in
+    ~/.hermes/.env bzw. ~/.hermes/profiles/<name>/.env, danach `hermes gateway
+    restart`). Gibt None zurück, wenn nicht aktiviert oder die Datei fehlt (kein
+    Fehler — einfach 'Feature nicht genutzt'), sonst {'host','port','key'}."""
+    env_path = Path(_hermes_home_for(cfg.get('hermes_profile', ''))) / '.env'
+    if not env_path.is_file():
+        return None
+    values = {}
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            values[key.strip()] = val.strip().strip('"').strip("'")
+    except Exception as e:
+        log.warning(f'Could not read Hermes .env at {env_path}: {e}')
+        return None
+
+    if values.get('API_SERVER_ENABLED', '').lower() not in ('true', '1', 'yes'):
+        return None
+
+    return {
+        'host': values.get('API_SERVER_HOST') or '127.0.0.1',
+        'port': values.get('API_SERVER_PORT') or '8642',
+        'key':  values.get('API_SERVER_KEY') or '',
+    }
+
+
+def _hermes_api_server_ready(cfg):
+    """Kombiniert Config-Check + Live-Probe (GET /health, kurzer Timeout) — eine
+    .env, die "enabled" sagt, garantiert nicht, dass der Gateway seit der Änderung
+    auch neu gestartet wurde oder gerade läuft. Gibt die Server-Config zurück, wenn
+    WIRKLICH nutzbar, sonst None (Aufrufer fällt dann auf den CLI-Pfad zurück)."""
+    server_cfg = _hermes_api_server_config(cfg)
+    if server_cfg is None:
+        return None
+    try:
+        url = f"http://{server_cfg['host']}:{server_cfg['port']}/health"
+        r = requests.get(url, timeout=2)
+        if r.status_code != 200:
+            log.info(f'Hermes API server /health returned {r.status_code} — falling back to CLI.')
+            return None
+    except Exception as e:
+        log.info(f'Hermes API server not reachable ({e}) — falling back to CLI.')
+        return None
+    return server_cfg
+
+
 def _parse_hermes_output(raw, stderr=''):
     """Trennt Antworttext und Session-ID aus der Hermes-Ausgabe.
 
@@ -1087,6 +1138,105 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
     return final_answer, extracted_sid
 
 
+def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
+                                session_id_override=None, on_partial=None):
+    """Streaming über Hermes' eigenen OpenAI-kompatiblen API-Server (siehe
+    _hermes_api_server_ready) — komplett anderer Weg als bei Claude: kein
+    CLI-Subprozess, sondern ein einzelner HTTP-Call an /v1/chat/completions mit
+    stream=true.
+
+    WICHTIG (2026-07-25): Noch NICHT live gegen eine echte Instanz verifiziert —
+    folgt dem dokumentierten/angenommenen OpenAI-Chat-Completions-SSE-Format
+    ("data: {...}"-Frames, choices[0].delta.content, abschließend "data: [DONE]")
+    und einem angenommenen X-Hermes-Session-Id-Header für Session-Kontinuität.
+    Bei JEDEM Fehler (Verbindung, HTTP-Fehlercode, kaputtes/unerwartetes Format,
+    kein Text erhalten) gibt diese Funktion (None, None) zurück — der Aufrufer
+    (process_wakeup) fällt dann auf den bewährten CLI-Pfad (call_agent_cli) zurück,
+    exakt wie beim Claude-Streaming. Das fängt harte Fehlschläge ab; ein *falsch*
+    aber fehlerfrei beantworteter Request (z.B. System-Prompt wird vom Server
+    stillschweigend ignoriert) würde davon NICHT erkannt — das lässt sich nur durch
+    einen echten Test gegen eine aktive Instanz verifizieren.
+
+    Rückgabe: (answer, session_id) — answer=None bei Fehler.
+    """
+    resume_id = session_id_override or _current_session_id
+
+    messages = []
+    if system_prompt:
+        # Angenommen: der Server unterstützt eine native system-Rolle (OpenAI-
+        # kompatibel) — anders als der CLI-Pfad, der mangels --system-prompt-Flag
+        # den Voranstellen-Trick braucht (_frame_one_time_system_prompt).
+        messages.append({'role': 'system', 'content': system_prompt})
+    messages.append({'role': 'user', 'content': prompt})
+
+    url = f"http://{server_cfg['host']}:{server_cfg['port']}/v1/chat/completions"
+    headers = {'Content-Type': 'application/json'}
+    if server_cfg.get('key'):
+        headers['Authorization'] = f"Bearer {server_cfg['key']}"
+    if resume_id:
+        headers['X-Hermes-Session-Id'] = resume_id
+
+    timeout = cfg.get('cli_timeout', 600)
+    accumulated = ''
+    last_post = 0.0
+    last_posted = None
+
+    log.info(f'Calling Hermes API server (streaming): {url}')
+
+    try:
+        with requests.post(url, headers=headers,
+                            json={'messages': messages, 'stream': True},
+                            stream=True, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                log.error(f'Hermes API server returned HTTP {resp.status_code}')
+                return None, None
+
+            # Angenommen: eine (neue oder fortgesetzte) Session-ID kommt als
+            # Response-Header zurück. Falls anders übertragen, bleibt es schlicht
+            # bei resume_id (bzw. leer bei neuer Session) — kein Crash, nur keine
+            # Session-Kontinuität für diesen einen Call.
+            session_id = resp.headers.get('X-Hermes-Session-Id') or resume_id
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith('data:'):
+                    continue
+                payload = line[len('data:'):].strip()
+                if payload == '[DONE]':
+                    break
+                try:
+                    evt = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = evt.get('choices') or []
+                if not choices:
+                    continue
+                piece = (choices[0].get('delta') or {}).get('content') or ''
+                if piece:
+                    accumulated += piece
+                    now = time.monotonic()
+                    if on_partial and (now - last_post) >= 1.5:
+                        on_partial(accumulated)
+                        last_post   = now
+                        last_posted = accumulated
+    except Exception as e:
+        log.warning(f'Hermes API server streaming failed (falling back to CLI): {e}')
+        return None, None
+
+    if not accumulated:
+        log.warning('Hermes API server returned no content — falling back to CLI.')
+        return None, None
+
+    if session_id:
+        store_session_id(session_id)
+
+    if on_partial and accumulated != last_posted:
+        on_partial(accumulated)
+
+    log.info(f'Hermes API server answered via streaming ({len(accumulated)} chars)')
+    return accumulated, session_id
+
+
 def _safe_attachment_name(name, job_id):
     """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
     Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
@@ -1145,9 +1295,17 @@ def process_wakeup(cfg):
     # vor der RAM-gehaltenen Session. Leer bei Legacy-Jobs (Alexa/Siri/alte App) oder
     # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
     job_session_id = job.get('session_id') or None
-    # Streaming (Phase 1): nur wenn die App es angefordert hat UND die konfigurierte
-    # CLI die Claude-CLI ist (nur die streamt sauberes NDJSON). Sonst normaler Pfad.
-    wants_stream = bool(job.get('wants_stream')) and _is_claude_binary(_cli_binary(cfg))
+    # Streaming: nur wenn die App es angefordert hat UND ein streaming-fähiger Pfad
+    # existiert — Claude (CLI, sauberes NDJSON) ODER Hermes MIT aktiviertem und
+    # erreichbarem API-Server (2026-07-25 ergänzt). OpenClaw hat noch keinen
+    # Streaming-Pfad (Phase 3, offen). Der Hermes-Check läuft nur, wenn wants_stream
+    # überhaupt angefragt UND das Binary Hermes ist — kein unnötiger .env-Read/
+    # Health-Probe bei jedem Job.
+    wants_stream_requested = bool(job.get('wants_stream'))
+    is_claude_cli  = _is_claude_binary(_cli_binary(cfg))
+    is_hermes_cli  = _is_hermes_binary(_cli_binary(cfg))
+    hermes_api_cfg = _hermes_api_server_ready(cfg) if (wants_stream_requested and is_hermes_cli) else None
+    wants_stream   = wants_stream_requested and (is_claude_cli or hermes_api_cfg is not None)
 
     if not prompt or not job_id:
         log.warning('Job has no prompt or id, skipping.')
@@ -1189,17 +1347,32 @@ def process_wakeup(cfg):
         if f:
             downloaded_files.append(f)
 
+    # Hermes-API-Server unterstützt (noch) keine Datei-/Bildanhänge (nur der
+    # CLI-Pfad mit --image) — mit Anhang direkt auf den CLI-Pfad, kein sinnloser
+    # Streaming-Versuch, der den Anhang ohnehin verwerfen würde.
+    if wants_stream and hermes_api_cfg is not None and downloaded_files:
+        log.info(f'Job #{job_id}: attachment present — skipping Hermes API-server streaming, using CLI.')
+        wants_stream = False
+
     if wants_stream:
         # Streaming-Pfad: Zwischentext gedrosselt an put_partial.php schicken. Bei
         # jedem Fehlschlag (kein Ergebnis, CLI-Fehler, Timeout) auf den bewährten
         # nicht-streamenden Pfad zurückfallen, damit der Nutzer trotzdem eine Antwort
         # bekommt — Streaming ist reines Zusatz-Komfort, kein kritischer Pfad.
-        log.info(f'Job #{job_id}: streaming enabled (Claude)')
-        answer, new_session_id = call_agent_cli_streaming(
-            cfg, prompt, system_prompt, files=downloaded_files or None,
-            session_id_override=job_session_id,
-            on_partial=lambda text: put_partial(cfg, job_id, text),
-        )
+        if is_claude_cli:
+            log.info(f'Job #{job_id}: streaming enabled (Claude)')
+            answer, new_session_id = call_agent_cli_streaming(
+                cfg, prompt, system_prompt, files=downloaded_files or None,
+                session_id_override=job_session_id,
+                on_partial=lambda text: put_partial(cfg, job_id, text),
+            )
+        else:
+            log.info(f'Job #{job_id}: streaming enabled (Hermes API server)')
+            answer, new_session_id = call_agent_hermes_streaming(
+                cfg, hermes_api_cfg, prompt, system_prompt,
+                session_id_override=job_session_id,
+                on_partial=lambda text: put_partial(cfg, job_id, text),
+            )
         if answer is None:
             log.warning(f'Job #{job_id}: streaming failed — falling back to non-streaming run.')
             answer, new_session_id = call_agent_cli(
