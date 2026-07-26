@@ -622,6 +622,63 @@ def _hermes_api_server_ready(cfg):
     return server_cfg
 
 
+def _openclaw_config():
+    """Liest die Gateway-Einstellungen aus OpenClaws eigener Config-Datei
+    (~/.openclaw/openclaw.json) — analog zu _hermes_api_server_config. Aktivierung
+    laut offizieller Doku (docs.openclaw.ai/gateway/openai-http-api, 2026-07):
+    `openclaw config set gateway.http.endpoints.chatCompletions.enabled true` +
+    `gateway.auth.mode`/`gateway.auth.token`. Gibt None zurück, wenn die Datei fehlt,
+    der Endpunkt nicht aktiviert ist, oder kein Token gesetzt ist (kein Fehler —
+    einfach 'Feature nicht genutzt')."""
+    config_path = Path.home() / '.openclaw' / 'openclaw.json'
+    if not config_path.is_file():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception as e:
+        log.warning(f'Could not read/parse OpenClaw config at {config_path}: {e}')
+        return None
+
+    gateway    = data.get('gateway') or {}
+    http_cfg   = gateway.get('http') or {}
+    endpoints  = http_cfg.get('endpoints') or {}
+    chat_compl = endpoints.get('chatCompletions') or {}
+    if not chat_compl.get('enabled'):
+        return None
+
+    auth  = gateway.get('auth') or {}
+    token = auth.get('token') or auth.get('password') or ''
+    if not token:
+        return None
+
+    return {
+        'host':  '127.0.0.1',
+        'port':  gateway.get('port') or 18789,
+        'token': token,
+    }
+
+
+def _openclaw_streaming_ready(cfg):
+    """Kombiniert Config-Check + Live-Probe. GET /v1/models ist der einzige
+    dokumentiert bestätigte einfache GET-Endpunkt (kein /health für OpenClaw
+    verifiziert, anders als bei Hermes) — dient hier als Liveness+Auth-Check. Gibt
+    die Server-Config zurück, wenn WIRKLICH nutzbar, sonst None (Aufrufer fällt dann
+    auf den CLI-Pfad zurück)."""
+    server_cfg = _openclaw_config()
+    if server_cfg is None:
+        return None
+    try:
+        url = f"http://{server_cfg['host']}:{server_cfg['port']}/v1/models"
+        r = requests.get(url, headers={'Authorization': f"Bearer {server_cfg['token']}"}, timeout=2)
+        if r.status_code != 200:
+            log.info(f'OpenClaw gateway /v1/models returned {r.status_code} — falling back to CLI.')
+            return None
+    except Exception as e:
+        log.info(f'OpenClaw gateway not reachable ({e}) — falling back to CLI.')
+        return None
+    return server_cfg
+
+
 def _parse_hermes_output(raw, stderr=''):
     """Trennt Antworttext und Session-ID aus der Hermes-Ausgabe.
 
@@ -1293,6 +1350,128 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
     return accumulated, session_id
 
 
+def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='',
+                                  session_id_override=None, on_partial=None):
+    """Streaming über OpenClaws eigenen Gateway-OpenAI-kompatiblen
+    Chat-Completions-Endpunkt (siehe _openclaw_streaming_ready). Wire-Format laut
+    offizieller Doku (docs.openclaw.ai/gateway/openai-http-api, 2026-07 recherchiert):
+    Standard-OpenAI-SSE ("data: {...}", choices[0].delta.content, "data: [DONE]").
+
+    OFFENE FRAGE (2026-07-26, noch NICHT live verifiziert): Tool-Aufrufe kommen laut
+    Doku als delta.tool_calls-Chunks, gefolgt von einem Chunk mit
+    finish_reason=="tool_calls" — das Standard-OpenAI-Function-Calling-Protokoll, bei
+    dem normalerweise der CALLER das Tool ausführen und das Ergebnis in einem
+    Folge-Request zurückmelden muss. Unklar: löst OpenClaw seine eigenen
+    (MCP-)Tools intern selbst auf (Stream läuft weiter bis zur echten Antwort, wie
+    bei Hermes) — oder bricht der Stream danach wirklich ab? Absichtlich KEIN
+    Sonderfall-Code dafür: falls Letzteres zutrifft, bleibt "accumulated" leer (keine
+    echten Text-Deltas empfangen) → das bestehende "leere Antwort = Fehler"-Verhalten
+    unten löst automatisch den CLI-Fallback aus, ganz ohne Extra-Logik. Jeder
+    finish_reason wird zusätzlich geloggt, damit sich diese Frage aus einem echten
+    Testlauf beantworten lässt (siehe Diagnose-Logging unten).
+
+    Session-Kontinuität: eigener Header x-openclaw-session-key (dokumentiert) — WIR
+    bestimmen den Wert (neu generiert, falls keine bestehende Session), anders als
+    bei Hermes, wo der Server eine ID zurückgibt.
+
+    Rückgabe: (answer, session_id) — answer=None bei Fehler.
+    """
+    resume_id = session_id_override or _current_session_id
+    if not resume_id:
+        import uuid as _uuid
+        resume_id = str(_uuid.uuid4())
+
+    messages = []
+    if system_prompt:
+        messages.append({'role': 'system', 'content': system_prompt})
+    messages.append({'role': 'user', 'content': prompt})
+
+    url = f"http://{server_cfg['host']}:{server_cfg['port']}/v1/chat/completions"
+    headers = {
+        'Content-Type':           'application/json',
+        'Authorization':          f"Bearer {server_cfg['token']}",
+        'x-openclaw-session-key': resume_id,
+    }
+    timeout = cfg.get('cli_timeout', 600)
+
+    accumulated  = ''
+    last_post    = 0.0
+    last_posted  = None
+    announced_tool_indexes = set()
+
+    log.info(f'Calling OpenClaw gateway (streaming): {url}')
+
+    try:
+        with requests.post(url, headers=headers,
+                            json={'model': 'openclaw', 'messages': messages, 'stream': True},
+                            stream=True, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                log.error(f'OpenClaw gateway returned HTTP {resp.status_code}: {resp.text[:300]}')
+                return None, None
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith('data:'):
+                    continue
+                payload = line[len('data:'):].strip()
+                if payload == '[DONE]':
+                    break
+                try:
+                    evt = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = evt.get('choices') or []
+                if not choices:
+                    log.info(f'OpenClaw SSE event ohne choices (Format-Diagnose): {payload[:300]}')
+                    continue
+
+                choice        = choices[0]
+                delta         = choice.get('delta') or {}
+                finish_reason = choice.get('finish_reason')
+                if finish_reason:
+                    # Diagnose (2026-07-26): zeigt genau, ob nach "tool_calls" noch
+                    # ein weiterer Chunk mit "stop" + echtem Text kommt, oder ob das
+                    # bereits das Ende ist — beantwortet die offene Frage oben.
+                    log.info(f'OpenClaw stream finish_reason (Format-Diagnose): {finish_reason}')
+
+                # Tool-Aufruf ankündigen (Standard-OpenAI-Function-Calling-Delta) —
+                # nur beim ERSTEN Chunk pro Tool-Call-Index (function.name steht nur
+                # dort, spätere Chunks tragen nur noch Argument-Fragmente).
+                for tc in (delta.get('tool_calls') or []):
+                    idx  = tc.get('index', 0)
+                    name = (tc.get('function') or {}).get('name')
+                    if name and idx not in announced_tool_indexes:
+                        announced_tool_indexes.add(idx)
+                        if on_partial:
+                            status_line = f'🔧 {name} …'
+                            on_partial(status_line)
+                            last_posted = status_line
+
+                piece = delta.get('content') or ''
+                if piece:
+                    accumulated += piece
+                    now = time.monotonic()
+                    if on_partial and (now - last_post) >= 1.5:
+                        on_partial(accumulated)
+                        last_post   = now
+                        last_posted = accumulated
+    except Exception as e:
+        log.warning(f'OpenClaw gateway streaming failed (falling back to CLI): {e}')
+        return None, None
+
+    if not accumulated:
+        log.warning('OpenClaw gateway returned no content — falling back to CLI.')
+        return None, None
+
+    store_session_id(resume_id)
+
+    if on_partial and accumulated != last_posted:
+        on_partial(accumulated)
+
+    log.info(f'OpenClaw gateway answered via streaming ({len(accumulated)} chars)')
+    return accumulated, resume_id
+
+
 def _safe_attachment_name(name, job_id):
     """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
     Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
@@ -1352,16 +1531,19 @@ def process_wakeup(cfg):
     # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
     job_session_id = job.get('session_id') or None
     # Streaming: nur wenn die App es angefordert hat UND ein streaming-fähiger Pfad
-    # existiert — Claude (CLI, sauberes NDJSON) ODER Hermes MIT aktiviertem und
-    # erreichbarem API-Server (2026-07-25 ergänzt). OpenClaw hat noch keinen
-    # Streaming-Pfad (Phase 3, offen). Der Hermes-Check läuft nur, wenn wants_stream
-    # überhaupt angefragt UND das Binary Hermes ist — kein unnötiger .env-Read/
-    # Health-Probe bei jedem Job.
+    # existiert — Claude (CLI, sauberes NDJSON) ODER Hermes/OpenClaw MIT aktiviertem
+    # und erreichbarem eigenem Gateway (2026-07-25/26 ergänzt). Die Hermes-/OpenClaw-
+    # Checks laufen nur, wenn wants_stream überhaupt angefragt UND das jeweilige
+    # Binary aktiv ist — kein unnötiger Config-Read/Live-Probe bei jedem Job.
     wants_stream_requested = bool(job.get('wants_stream'))
-    is_claude_cli  = _is_claude_binary(_cli_binary(cfg))
-    is_hermes_cli  = _is_hermes_binary(_cli_binary(cfg))
-    hermes_api_cfg = _hermes_api_server_ready(cfg) if (wants_stream_requested and is_hermes_cli) else None
-    wants_stream   = wants_stream_requested and (is_claude_cli or hermes_api_cfg is not None)
+    is_claude_cli    = _is_claude_binary(_cli_binary(cfg))
+    is_hermes_cli    = _is_hermes_binary(_cli_binary(cfg))
+    is_openclaw_cli  = _is_openclaw_binary(_cli_binary(cfg))
+    hermes_api_cfg   = _hermes_api_server_ready(cfg) if (wants_stream_requested and is_hermes_cli) else None
+    openclaw_api_cfg = _openclaw_streaming_ready(cfg) if (wants_stream_requested and is_openclaw_cli) else None
+    wants_stream     = wants_stream_requested and (
+        is_claude_cli or hermes_api_cfg is not None or openclaw_api_cfg is not None
+    )
 
     if not prompt or not job_id:
         log.warning('Job has no prompt or id, skipping.')
@@ -1403,11 +1585,11 @@ def process_wakeup(cfg):
         if f:
             downloaded_files.append(f)
 
-    # Hermes-API-Server unterstützt (noch) keine Datei-/Bildanhänge (nur der
-    # CLI-Pfad mit --image) — mit Anhang direkt auf den CLI-Pfad, kein sinnloser
-    # Streaming-Versuch, der den Anhang ohnehin verwerfen würde.
-    if wants_stream and hermes_api_cfg is not None and downloaded_files:
-        log.info(f'Job #{job_id}: attachment present — skipping Hermes API-server streaming, using CLI.')
+    # Hermes-API-Server/OpenClaw-Gateway unterstützen (noch) keine Datei-/Bildanhänge
+    # (nur der jeweilige CLI-Pfad) — mit Anhang direkt auf den CLI-Pfad, kein
+    # sinnloser Streaming-Versuch, der den Anhang ohnehin verwerfen würde.
+    if wants_stream and (hermes_api_cfg is not None or openclaw_api_cfg is not None) and downloaded_files:
+        log.info(f'Job #{job_id}: attachment present — skipping API-server streaming, using CLI.')
         wants_stream = False
 
     if wants_stream:
@@ -1422,10 +1604,17 @@ def process_wakeup(cfg):
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
             )
-        else:
+        elif hermes_api_cfg is not None:
             log.info(f'Job #{job_id}: streaming enabled (Hermes API server)')
             answer, new_session_id = call_agent_hermes_streaming(
                 cfg, hermes_api_cfg, prompt, system_prompt,
+                session_id_override=job_session_id,
+                on_partial=lambda text: put_partial(cfg, job_id, text),
+            )
+        else:
+            log.info(f'Job #{job_id}: streaming enabled (OpenClaw gateway)')
+            answer, new_session_id = call_agent_openclaw_streaming(
+                cfg, openclaw_api_cfg, prompt, system_prompt,
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
             )
