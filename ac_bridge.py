@@ -1437,15 +1437,27 @@ def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='',
                 # Tool-Aufruf ankündigen (Standard-OpenAI-Function-Calling-Delta) —
                 # nur beim ERSTEN Chunk pro Tool-Call-Index (function.name steht nur
                 # dort, spätere Chunks tragen nur noch Argument-Fragmente).
-                for tc in (delta.get('tool_calls') or []):
-                    idx  = tc.get('index', 0)
-                    name = (tc.get('function') or {}).get('name')
-                    if name and idx not in announced_tool_indexes:
-                        announced_tool_indexes.add(idx)
-                        if on_partial:
-                            status_line = f'🔧 {name} …'
-                            on_partial(status_line)
-                            last_posted = status_line
+                tool_calls = delta.get('tool_calls')
+                if tool_calls:
+                    # Diagnose (2026-07-26): erster Live-Test zeigte trotz sichtbarer
+                    # MCP-Nutzung (finish_reason blieb bei "stop", kein "tool_calls")
+                    # keine Statuszeile — kompletten Chunk loggen, um zu sehen ob
+                    # überhaupt tool_calls-Deltas ankommen und wie sie genau aussehen.
+                    log.info(f'OpenClaw delta.tool_calls (Format-Diagnose): {tool_calls}')
+                    for tc in tool_calls:
+                        idx  = tc.get('index', 0)
+                        name = (tc.get('function') or {}).get('name')
+                        if name and idx not in announced_tool_indexes:
+                            announced_tool_indexes.add(idx)
+                            if on_partial:
+                                status_line = f'🔧 {name} …'
+                                on_partial(status_line)
+                                last_posted = status_line
+                elif delta and not delta.get('content'):
+                    # Diagnose: nicht-leeres Delta ohne content UND ohne tool_calls
+                    # (z.B. reine role-Ankündigung ist normal, aber evtl. steckt hier
+                    # OpenClaws Tool-Signal in einer ganz anderen Form).
+                    log.info(f'OpenClaw delta ohne content/tool_calls (Format-Diagnose): {delta}')
 
                 piece = delta.get('content') or ''
                 if piece:
