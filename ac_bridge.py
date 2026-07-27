@@ -1521,6 +1521,97 @@ def download_attachment(cfg, job_id, attachment_token, attachment_name):
 
 
 # ─────────────────────────────────────────────
+# Session-Datei aus dem Verlauf anzeigen (Umkehrung von download_attachment:
+# hier hat die Bridge die Datei, die App will sie sehen)
+# ─────────────────────────────────────────────
+
+SESSION_FILES_DIR   = (REPO_DIR / 'session_files').resolve()
+SF_UPLOAD_CHUNK      = 2 * 1024 * 1024   # 2 MB, sicher unter dem 3-MB-Chunk-Limit von put_session_file.php
+SF_MAX_UPLOAD_BYTES  = 20 * 1024 * 1024  # muss zu SF_MAX_TOTAL_BYTES in put_session_file.php passen
+
+
+def _resolve_session_file_path(file_path):
+    """Prüft, dass der von der App gemeldete Pfad TATSÄCHLICH innerhalb von
+    session_files/ liegt (dorthin lädt ausschließlich download_attachment()
+    Dateien herunter) — verhindert beliebigen Datei-Lesezugriff über einen
+    manipulierten/erratenen Pfad. Gibt den aufgelösten Path zurück oder None."""
+    try:
+        resolved = Path(file_path).expanduser().resolve()
+        resolved.relative_to(SESSION_FILES_DIR)
+    except (ValueError, OSError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _report_session_file_error(cfg, message):
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_session_file_error.php',
+            json={'token_b': cfg['token_b'], 'error': message},
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        log.warning(f'send_session_file: {message}')
+    except Exception as e:
+        log.error(f'_report_session_file_error: post failed: {e}')
+
+
+def send_session_file(cfg, file_path):
+    """Wird via MQTT action=send-session-file ausgelöst (App hat im
+    Nachrichtentext einen session_files-Pfad erkannt und angetippt). Lädt die
+    Datei in Chunks zu put_session_file.php hoch (spiegelbildlich zu
+    upload_chunk.php/download_attachment, nur Bridge → Server statt App →
+    Server); bei jedem Validierungs-/Übertragungsfehler wird stattdessen
+    put_session_file_error.php gemeldet, damit die App nicht endlos pollt."""
+    if not file_path:
+        _report_session_file_error(cfg, 'Kein Dateipfad übermittelt')
+        return
+
+    resolved = _resolve_session_file_path(file_path)
+    if resolved is None:
+        _report_session_file_error(cfg, 'Datei nicht gefunden oder außerhalb von session_files/')
+        return
+
+    size = resolved.stat().st_size
+    if size > SF_MAX_UPLOAD_BYTES:
+        _report_session_file_error(cfg, f'Datei zu groß ({size} bytes, Limit {SF_MAX_UPLOAD_BYTES})')
+        return
+
+    file_name = resolved.name
+    total     = max(1, (size + SF_UPLOAD_CHUNK - 1) // SF_UPLOAD_CHUNK)
+
+    try:
+        with open(resolved, 'rb') as fh:
+            for index in range(total):
+                chunk = fh.read(SF_UPLOAD_CHUNK)
+                r = requests.post(
+                    cfg['server_url'] + '/put_session_file.php',
+                    params={'index': index, 'total': total, 'file_name': file_name},
+                    headers={'X-AC-Token-B': cfg['token_b'], 'Content-Type': 'application/octet-stream'},
+                    data=chunk,
+                    timeout=60,
+                )
+                if r.status_code != 200:
+                    log.error(f'send_session_file: HTTP {r.status_code} bei Chunk {index}/{total}: {r.text[:200]}')
+                    _report_session_file_error(cfg, 'Übertragung fehlgeschlagen')
+                    return
+                data = r.json()
+                if data.get('complete'):
+                    if 'token_b_new' in data:
+                        cfg['token_b'] = data['token_b_new']
+                        save_config(cfg)
+                    log.info(f'send_session_file: {file_name} ({size} bytes) hochgeladen')
+    except Exception as e:
+        log.error(f'send_session_file failed for {resolved}: {e}')
+        _report_session_file_error(cfg, 'Übertragung fehlgeschlagen')
+
+
+# ─────────────────────────────────────────────
 # Job processing
 # ─────────────────────────────────────────────
 def process_wakeup(cfg):
@@ -2481,6 +2572,8 @@ def on_message(client, userdata, msg):
         send_history_detail(cfg, payload.get('session_id', ''))
     elif action == 'delete-history-session':
         delete_history_session(cfg, payload.get('session_id', ''))
+    elif action == 'send-session-file':
+        send_session_file(cfg, payload.get('file_path', ''))
     elif action == 'list-hermes-profiles':
         send_hermes_profiles(cfg)
     else:
