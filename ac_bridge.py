@@ -2060,10 +2060,18 @@ def _hermes_epoch_to_iso(ts):
         return ''
 
 
+_HERMES_SESSION_ID_RE = re.compile(r'\d{8}_\d{6}|api-[0-9a-fA-F]+')
+
+
 def _parse_hermes_sessions_table(text):
     """Parst `hermes sessions list`. Spalten sind durch 2+ Leerzeichen getrennt
     (Titel selbst enthält nur einfache Leerzeichen) — robuster als Offset-Slicing.
-    Die ID ist das Feld im Format YYYYMMDD_HHMMSS…, der Titel steht ganz vorne."""
+    Die ID ist normalerweise im Format YYYYMMDD_HHMMSS…, der Titel steht ganz
+    vorne. Sessions aus dem Hermes-API-Server (siehe call_agent_hermes_streaming)
+    haben stattdessen eine `api-<hex>`-ID — ohne das zweite Regex-Alternativ
+    wurden diese Zeilen hier stillschweigend verworfen und tauchten dadurch nie
+    im Verlauf-Tab auf (live verifiziert 2026-07-27: Zeile war in `sessions list`
+    vorhanden, nur der Parser hat sie rausgefiltert)."""
     lines = text.splitlines()
     header_idx = next((i for i, l in enumerate(lines)
                        if 'Title' in l and 'ID' in l and 'Last Active' in l), None)
@@ -2075,10 +2083,10 @@ def _parse_hermes_sessions_table(text):
         if not s or set(s) <= set('─-—│| '):  # leer oder Trennlinie (inkl. Leerzeichen)
             continue
         parts = re.split(r'\s{2,}', s)
-        sid = next((p.split()[0] for p in parts if re.match(r'\d{8}_\d{6}', p)), '')
+        sid = next((p.split()[0] for p in parts if _HERMES_SESSION_ID_RE.match(p)), '')
         if not sid:
             continue
-        title = parts[0] if parts and not re.match(r'\d{8}_\d{6}', parts[0]) else ''
+        title = parts[0] if parts and not _HERMES_SESSION_ID_RE.match(parts[0]) else ''
         entries.append({
             'session_id':    sid,
             'title':         title,  # kann leer/Platzhalter sein — siehe _hermes_history_list
