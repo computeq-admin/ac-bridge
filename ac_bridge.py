@@ -781,6 +781,22 @@ _HERMES_MANAGED_FLAGS_BARE = {'-Q', '--yolo', '--accept-hooks'}
 _OPENCLAW_MANAGED_FLAGS_BARE = {'--json'}
 
 
+def _file_note_prefix(files):
+    """Text-Hinweis auf mitgeschickte Dateien, wie im CLI-Fallback unten (kein
+    cli_file_param konfiguriert) — der Agent liest die Datei selbst über sein
+    eigenes Tool (z.B. Read/vision_analyze). Auch von den Hermes-/OpenClaw-
+    Streaming-Funktionen genutzt: deren APIs kennen kein natives Datei-
+    Attachment (nur Text-Messages), der Prompt-Hinweis ist dort die EINZIGE
+    Möglichkeit, live verifiziert 2026-07 (siehe Bridge-Log 'attachment
+    present' + AC-Chat-Verlauf mit "The user sent the following file...")."""
+    if not files:
+        return ''
+    return '\n'.join(
+        f'The user sent the following file, please read and process it: {Path(fp).resolve()}'
+        for fp in files
+    )
+
+
 def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None,
                           streaming=False):
     """Baut die vollständige CLI-Kommandozeile (Session-, System-Prompt-, Datei- und
@@ -919,10 +935,7 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         else:
             # Kein CLI-Flag konfiguriert: Dateipfad im Prompt nennen.
             # Claude Code CLI hat den Read-Tool und liest die Datei selbst.
-            file_note = '\n'.join(
-                f'The user sent the following file, please read and process it: {Path(fp).resolve()}'
-                for fp in files
-            )
+            file_note = _file_note_prefix(files)
             prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
 
     prompt_param = cfg.get('cli_prompt_param', '')
@@ -1230,12 +1243,18 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
     return final_answer, extracted_sid
 
 
-def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
+def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='', files=None,
                                 session_id_override=None, on_partial=None):
     """Streaming über Hermes' eigenen OpenAI-kompatiblen API-Server (siehe
     _hermes_api_server_ready) — komplett anderer Weg als bei Claude: kein
     CLI-Subprozess, sondern ein einzelner HTTP-Call an /v1/chat/completions mit
     stream=true.
+
+    files: wie bei call_agent_cli — der API-Server kennt kein natives Datei-
+    Attachment (nur Text-Messages), daher wird derselbe Text-Hinweis wie beim
+    CLI-Fallback vor den Prompt gesetzt (siehe _file_note_prefix). Ehemals
+    wurde bei Anhang komplett auf den CLI-Pfad ausgewichen — seit dieser
+    Ergänzung kann auch der Streaming-Pfad Anhänge verarbeiten.
 
     Live verifiziert 2026-07-26 gegen eine echte Instanz (Kalender-MCP-Nutzung):
     OpenAI-Chat-Completions-SSE-Format ("data: {...}"-Frames, choices[0].delta.
@@ -1256,6 +1275,10 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
     Rückgabe: (answer, session_id) — answer=None bei Fehler.
     """
     resume_id = session_id_override or _current_session_id
+
+    file_note = _file_note_prefix(files)
+    if file_note:
+        prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
 
     messages = []
     if system_prompt:
@@ -1350,12 +1373,15 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='',
     return accumulated, session_id
 
 
-def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='',
+def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='', files=None,
                                   session_id_override=None, on_partial=None):
     """Streaming über OpenClaws eigenen Gateway-OpenAI-kompatiblen
     Chat-Completions-Endpunkt (siehe _openclaw_streaming_ready). Wire-Format laut
     offizieller Doku (docs.openclaw.ai/gateway/openai-http-api, 2026-07 recherchiert):
     Standard-OpenAI-SSE ("data: {...}", choices[0].delta.content, "data: [DONE]").
+
+    files: siehe call_agent_hermes_streaming — derselbe Text-Hinweis-Trick, da
+    auch dieser Gateway-Endpunkt kein natives Datei-Attachment kennt.
 
     OFFENE FRAGE (2026-07-26, noch NICHT live verifiziert): Tool-Aufrufe kommen laut
     Doku als delta.tool_calls-Chunks, gefolgt von einem Chunk mit
@@ -1380,6 +1406,10 @@ def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='',
     if not resume_id:
         import uuid as _uuid
         resume_id = str(_uuid.uuid4())
+
+    file_note = _file_note_prefix(files)
+    if file_note:
+        prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
 
     messages = []
     if system_prompt:
@@ -1688,13 +1718,6 @@ def process_wakeup(cfg):
         if f:
             downloaded_files.append(f)
 
-    # Hermes-API-Server/OpenClaw-Gateway unterstützen (noch) keine Datei-/Bildanhänge
-    # (nur der jeweilige CLI-Pfad) — mit Anhang direkt auf den CLI-Pfad, kein
-    # sinnloser Streaming-Versuch, der den Anhang ohnehin verwerfen würde.
-    if wants_stream and (hermes_api_cfg is not None or openclaw_api_cfg is not None) and downloaded_files:
-        log.info(f'Job #{job_id}: attachment present — skipping API-server streaming, using CLI.')
-        wants_stream = False
-
     if wants_stream:
         # Streaming-Pfad: Zwischentext gedrosselt an put_partial.php schicken. Bei
         # jedem Fehlschlag (kein Ergebnis, CLI-Fehler, Timeout) auf den bewährten
@@ -1710,14 +1733,14 @@ def process_wakeup(cfg):
         elif hermes_api_cfg is not None:
             log.info(f'Job #{job_id}: streaming enabled (Hermes API server)')
             answer, new_session_id = call_agent_hermes_streaming(
-                cfg, hermes_api_cfg, prompt, system_prompt,
+                cfg, hermes_api_cfg, prompt, system_prompt, files=downloaded_files or None,
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
             )
         else:
             log.info(f'Job #{job_id}: streaming enabled (OpenClaw gateway)')
             answer, new_session_id = call_agent_openclaw_streaming(
-                cfg, openclaw_api_cfg, prompt, system_prompt,
+                cfg, openclaw_api_cfg, prompt, system_prompt, files=downloaded_files or None,
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
             )
