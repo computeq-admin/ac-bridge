@@ -1514,22 +1514,28 @@ def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='', fil
     return accumulated, resume_id
 
 
-def _safe_attachment_name(name, job_id):
+def _safe_attachment_name(name, job_id, index=0):
     """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
     Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
-    damit wiederholte Uploads für denselben Job sich nicht überschreiben."""
+    damit wiederholte Uploads für denselben Job sich nicht überschreiben. index
+    zusätzlich davor, da mehrere Anhänge desselben Jobs (Mehrfachauswahl) denselben
+    Zeitstempel (Sekundenauflösung) UND denselben Originalnamen haben können (z.B.
+    zwei Fotos, beide "foto.jpg") — ohne index würden sie sich überschreiben."""
     base = os.path.basename(name or '').strip()
     base = re.sub(r'[^\w.\- ]+', '_', base)
     if not base or base in ('.', '..'):
         base = 'anhang'
-    return f'ios_att_{job_id}_{time.strftime("%Y%m%d_%H%M%S")}_{base}'
+    return f'ios_att_{job_id}_{time.strftime("%Y%m%d_%H%M%S")}_{index}_{base}'
 
 
-def download_attachment(cfg, job_id, attachment_token, attachment_name):
+def download_attachment(cfg, job_id, attachment_token, attachment_name, index=0):
     """Lädt den per Chunked-Upload zusammengesetzten Datei-Anhang eines Jobs vom
     Server (download_attachment.php, token_b-Auth) und legt ihn unter session_files/
     ab. Gibt den lokalen Pfad zurück oder None bei Fehler. Token-B rotiert hier NICHT
-    (Download-Response ist binär) — der get_job/put_answer-Zyklus rotiert ohnehin."""
+    (Download-Response ist binär) — der get_job/put_answer-Zyklus rotiert ohnehin.
+    index: Position innerhalb der attachments-Liste dieses Jobs (siehe
+    _safe_attachment_name) — bei mehreren Anhängen nötig, um Namenskollisionen zu
+    vermeiden, sonst unbenutzt (Default 0)."""
     try:
         r = requests.post(
             cfg['server_url'] + '/download_attachment.php',
@@ -1541,7 +1547,7 @@ def download_attachment(cfg, job_id, attachment_token, attachment_name):
             return None
         dest_dir = REPO_DIR / 'session_files'
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / _safe_attachment_name(attachment_name, job_id)
+        dest = dest_dir / _safe_attachment_name(attachment_name, job_id, index)
         dest.write_bytes(r.content)
         log.info(f'Attachment downloaded for job #{job_id}: {dest} ({len(r.content)} bytes)')
         return str(dest)
@@ -1657,8 +1663,16 @@ def process_wakeup(cfg):
     system_prompt = job.get('system_prompt', '')
     reset         = job.get('reset_history', True)
     image_data_b64 = job.get('image_data', '')
-    attachment_token = job.get('attachment_token', '')
-    attachment_name  = job.get('attachment_name', '')
+    # Mehrere Anhänge (neuer Server): Liste [{"token":..., "name":...}, ...].
+    # Fällt auf die alten Einzelfelder zurück, falls "attachments" fehlt (älterer
+    # Server, der das Feld noch nicht kennt) — symmetrisch zum Fallback, den die
+    # submit-Action serverseitig für eine alte App-Version macht.
+    attachments = job.get('attachments') or []
+    if not attachments:
+        legacy_token = job.get('attachment_token', '')
+        legacy_name  = job.get('attachment_name', '')
+        if legacy_token:
+            attachments = [{'token': legacy_token, 'name': legacy_name}]
     # App-gesteuertes Fortsetzen eines bestimmten (u.U. alten) Gesprächs: hat Vorrang
     # vor der RAM-gehaltenen Session. Leer bei Legacy-Jobs (Alexa/Siri/alte App) oder
     # wenn reset_history bereits True ist — dann verhält sich alles wie bisher.
@@ -1711,10 +1725,14 @@ def process_wakeup(cfg):
         except Exception as e:
             log.error(f'Image decode failed for job #{job_id}: {e}')
 
-    # Chunked-Upload-Anhang (neue App): Datei separat vom Server holen (umgeht das
-    # ~3 MB Webserver-Upload-Limit; der Download ist eine Response, unbegrenzt).
-    if attachment_token:
-        f = download_attachment(cfg, job_id, attachment_token, attachment_name)
+    # Chunked-Upload-Anhänge (neue App, ggf. mehrere): jede Datei separat vom
+    # Server holen (umgeht das ~3 MB Webserver-Upload-Limit; der Download ist
+    # eine Response, unbegrenzt).
+    for index, att in enumerate(attachments):
+        token = att.get('token', '')
+        if not token:
+            continue
+        f = download_attachment(cfg, job_id, token, att.get('name', ''), index)
         if f:
             downloaded_files.append(f)
 
