@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
@@ -602,13 +603,95 @@ def _hermes_api_server_config(cfg):
     }
 
 
+_HERMES_RUNTIME_STATUS_STALE_TTL_S = 120  # gleicher Wert wie Hermes selbst (gateway/status.py)
+
+
+def _hermes_runtime_status(profile):
+    """Liest {HERMES_HOME}/gateway_state.json des gewählten Profils — von Hermes
+    selbst geschrieben (gateway/status.py::write_runtime_status), u.a. mit
+    platforms.api_server.state ("connected"/"fatal"/"disconnected"), der PID
+    des Gateway-Prozesses und "updated_at". Das ist die einzige zuverlässige,
+    LOKALE Quelle dafür, ob DIESES Profil seinen eigenen API-Server wirklich
+    gestartet hat. Gibt None zurück, wenn die Datei fehlt/kaputt ist (kein
+    Fehler — z.B. Gateway nie gestartet)."""
+    state_path = Path(_hermes_home_for(profile)) / 'gateway_state.json'
+    if not state_path.is_file():
+        return None
+    try:
+        return json.loads(state_path.read_text())
+    except Exception as e:
+        log.warning(f'Could not read Hermes runtime status at {state_path}: {e}')
+        return None
+
+
+def _hermes_api_server_own_process(cfg):
+    """True, wenn gateway_state.json bestätigt, dass DIESES Profil (nicht ein
+    anderer Hermes-Account auf demselben Server) seinen eigenen api_server-
+    Adapter erfolgreich gebunden hat und der Gateway-Prozess noch lebt und
+    kürzlich seinen Status geschrieben hat.
+
+    Hintergrund (Recherche gegen den offiziellen Quellcode, github.com/
+    NousResearch/hermes-agent): Bindet der API-Server beim Start einen bereits
+    belegten Port (EADDRINUSE), weicht er NICHT automatisch auf einen anderen
+    Port aus — gateway/platforms/api_server.py::connect() fängt den OSError,
+    setzt einen dauerhaften, nicht erneut versuchten Fehler
+    (_set_fatal_error("api_server_port_in_use", ..., retryable=False)) und
+    gibt False zurück; der api_server-Adapter dieses Profils bleibt bis zu
+    einem manuellen `/platform resume api_server` (nach Port-Änderung) down.
+    Laufen mehrere Hermes-Accounts mit identischer (Default-)API_SERVER_PORT
+    auf demselben Server, gewinnt nur EINER den Bind — die anderen bekommen
+    diesen Fehler.
+
+    Ein reiner /health-Request auf den in der .env konfigurierten Host:Port
+    (wie zuvor) kann das NICHT unterscheiden: er liefert für die verlierenden
+    Profile trotzdem 200 OK, weil er in Wirklichkeit den GEWINNER-Account
+    beantwortet (/health enthält keinerlei Profil-/Account-Kennung). Ohne
+    diesen Check würde die Bridge also für 2 von 3 Accounts unbemerkt mit dem
+    FALSCHEN Hermes-Agenten sprechen. gateway_state.json wird lokal vom
+    jeweils eigenen Gateway-Prozess über sich selbst geschrieben und ist damit
+    unabhängig vom belegten Port eindeutig diesem Profil zuordenbar."""
+    status = _hermes_runtime_status(cfg.get('hermes_profile', ''))
+    if status is None:
+        return False
+    platform_state = ((status.get('platforms') or {}).get('api_server') or {}).get('state')
+    if platform_state != 'connected':
+        return False
+
+    updated_at = status.get('updated_at')
+    if isinstance(updated_at, str):
+        try:
+            ts = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age_s > _HERMES_RUNTIME_STATUS_STALE_TTL_S:
+                log.info(f'Hermes gateway_state.json is stale ({age_s:.0f}s) — treating api_server as not owned.')
+                return False
+        except Exception:
+            pass  # kaputtes/unbekanntes Format ignorieren, nicht deswegen scheitern
+
+    pid = status.get('pid')
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False  # Prozess tot — Status-Datei überlebt den Absturz
+    return True
+
+
 def _hermes_api_server_ready(cfg):
-    """Kombiniert Config-Check + Live-Probe (GET /health, kurzer Timeout) — eine
-    .env, die "enabled" sagt, garantiert nicht, dass der Gateway seit der Änderung
-    auch neu gestartet wurde oder gerade läuft. Gibt die Server-Config zurück, wenn
+    """Kombiniert Config-Check + Eigentums-Check (gateway_state.json) + Live-
+    Probe (GET /health, kurzer Timeout). Der Eigentums-Check MUSS vor dem
+    /health-Request laufen, sonst könnte dieser bei einem Port-Konflikt
+    zwischen mehreren Hermes-Accounts den API-Server eines ANDEREN Accounts
+    treffen (siehe _hermes_api_server_own_process). Eine .env, die "enabled"
+    sagt, garantiert außerdem nicht, dass der Gateway seit der Änderung auch
+    neu gestartet wurde oder gerade läuft. Gibt die Server-Config zurück, wenn
     WIRKLICH nutzbar, sonst None (Aufrufer fällt dann auf den CLI-Pfad zurück)."""
     server_cfg = _hermes_api_server_config(cfg)
     if server_cfg is None:
+        return None
+    if not _hermes_api_server_own_process(cfg):
+        log.info('Hermes API server not owned by this profile (gateway_state.json) — falling back to CLI.')
         return None
     try:
         url = f"http://{server_cfg['host']}:{server_cfg['port']}/health"
