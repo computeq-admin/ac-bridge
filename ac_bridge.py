@@ -1008,6 +1008,15 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         claude_model = cfg.get('claude_model', '')
         if claude_model in ('sonnet', 'opus', 'haiku', 'fable'):
             cmd += ['--model', claude_model]
+        # Reasoning-Tri-State (ConfigView.swift/ModelQuickSettingsSheet.swift):
+        # "auto" (Standard) hängt nichts an — die CLI/das Modell entscheidet
+        # selbst. "on" fordert mit --effort high aktiv mehr Reasoning an (kein
+        # harter Zwang, aber der stärkste dokumentierte Hebel für Headless-
+        # Aufrufe — siehe Recherche zu Claude Code CLI). "off" wird weiter unten
+        # über die Env-Var MAX_THINKING_TOKENS=0 umgesetzt (dort verifiziert
+        # als einzig zuverlässiger harter Abschalt-Weg).
+        if cfg.get('claude_reasoning') == 'on':
+            cmd += ['--effort', 'high']
     elif is_hermes:
         # Bridge-verwaltete Standard-Flags — siehe Modul-Kommentar oben. `streaming`
         # ändert hier (noch) nichts; Hermes-Streaming ist ein separates, späteres
@@ -1036,7 +1045,7 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
-    if is_claude and cfg.get('claude_reasoning_off'):
+    if is_claude and cfg.get('claude_reasoning') == 'off':
         # Schaltet Extended Thinking komplett aus (wirkt nicht bei Fable 5, siehe
         # ConfigView.swift-Kommentar) — Anthropic-eigene Env-Var, kein CLI-Flag
         # dafür vorhanden.
