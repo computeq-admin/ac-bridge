@@ -1001,6 +1001,13 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         else:
             cmd += ['--output-format', 'json']
         cmd.append('--dangerously-skip-permissions')
+        # Modell-Alias optional fest vorgeben (ConfigView.swift, "" = altes
+        # Verhalten, kein Flag). Bewusst dieselbe Whitelist wie serverseitig in
+        # ios_app_endpoint.php save_bridge_config — auch bei einem alten/
+        # manipulierten config.json kein beliebiger Wert an die CLI.
+        claude_model = cfg.get('claude_model', '')
+        if claude_model in ('sonnet', 'opus', 'haiku', 'fable'):
+            cmd += ['--model', claude_model]
     elif is_hermes:
         # Bridge-verwaltete Standard-Flags — siehe Modul-Kommentar oben. `streaming`
         # ändert hier (noch) nichts; Hermes-Streaming ist ein separates, späteres
@@ -1029,6 +1036,11 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
+    if is_claude and cfg.get('claude_reasoning_off'):
+        # Schaltet Extended Thinking komplett aus (wirkt nicht bei Fable 5, siehe
+        # ConfigView.swift-Kommentar) — Anthropic-eigene Env-Var, kein CLI-Flag
+        # dafür vorhanden.
+        env['MAX_THINKING_TOKENS'] = '0'
     if is_hermes:
         # Profil-Auswahl: HERMES_HOME zeigt auf das Home des gewählten Hermes-Profils.
         env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
