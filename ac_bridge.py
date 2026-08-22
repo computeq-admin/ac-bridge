@@ -775,6 +775,73 @@ def _openclaw_streaming_ready(cfg):
     return server_cfg
 
 
+_HERMES_REASONING_HEADER_RE = re.compile(r'^\s*┌─\s*Reasoning\b[^\n]*┐\s*\n+')
+
+
+def _format_hermes_reasoning_block(answer):
+    """Formt Hermes' 'Reasoning'-Panel-Ausgabe (Box-Kopfzeile ┌─ Reasoning ─...─┐,
+    OHNE schließende Boxkante beim Pipe-Capture — kein echtes TTY, siehe
+    call_agent_cli) in eine einspaltige/einzeilige Markdown-Tabelle vor der
+    eigentlichen Antwort um (Nutzerwunsch). Beide Apps rendern GFM-Pipe-Tabellen
+    bereits nativ (iOS: MarkdownTableView über splitMarkdownSegments, Web:
+    renderMarkdown) — keine Client-Änderung nötig.
+
+    NUR AN EINEM EINZIGEN Beispiel kalibriert (2026-08-22): dort erschien der
+    Reasoning-Text durch ein Live-Redraw-Artefakt zweimal direkt hintereinander
+    (einmal unregelmäßig über mehrere Absätze umgebrochen, einmal als sauberer
+    Absatz). Diese Funktion sucht deshalb zuerst nach einer Selbstverkettung über
+    eine wachsende Zahl führender, durch Leerzeilen getrennter Absätze; findet sie
+    keine (z.B. weil Hermes das Redraw-Artefakt behebt oder bei kürzerem Reasoning
+    gar nicht auftritt), nimmt sie ersatzweise nur den ersten Absatz als Reasoning
+    und alles danach als Antwort. Liefert bei jeder Unsicherheit (kein zweiter
+    Absatz nach der Kopfzeile) den Text UNVERÄNDERT zurück — lieber unformatiert
+    als falsch zerschnitten. MUSS nach dem Deploy an echten Antworten (kurz/lang,
+    mit/ohne Tool-Nutzung) nachgeprüft werden."""
+    m = _HERMES_REASONING_HEADER_RE.match(answer)
+    if not m:
+        return answer
+    rest = answer[m.end():]
+    paragraphs = re.split(r'\n\s*\n', rest)
+    if len(paragraphs) < 2:
+        return answer
+
+    def dedupe(text):
+        normalized = re.sub(r'\s+', ' ', text).strip()
+        n = len(normalized)
+        for half in (n // 2, (n + 1) // 2, (n - 1) // 2):
+            if half <= 10 or half >= n:
+                continue
+            first, second = normalized[:half].strip(), normalized[half:].strip()
+            if first and first == second:
+                return first
+        return normalized
+
+    reasoning_text = None
+    final_answer = None
+    for split_at in range(1, len(paragraphs)):
+        candidate = '\n\n'.join(paragraphs[:split_at])
+        deduped = dedupe(candidate)
+        # Nur als Treffer werten, wenn dedupe() wirklich etwas GEKÜRZT hat (echte
+        # Selbstverkettung erkannt) — sonst wäre jeder beliebige Split "ein Treffer".
+        if len(deduped) < len(re.sub(r'\s+', ' ', candidate).strip()):
+            reasoning_text = deduped
+            final_answer = '\n\n'.join(paragraphs[split_at:]).strip()
+            break
+
+    if reasoning_text is None:
+        # Kein Duplikations-Artefakt gefunden — einfacher Fall: erster Absatz ist
+        # das Reasoning, Rest die Antwort.
+        reasoning_text = re.sub(r'\s+', ' ', paragraphs[0]).strip()
+        final_answer = '\n\n'.join(paragraphs[1:]).strip()
+
+    if not reasoning_text or not final_answer:
+        return answer
+
+    cell = reasoning_text.replace('|', '\\|')
+    table = f'| Reasoning |\n| --- |\n| {cell} |'
+    return f'{table}\n\n{final_answer}'
+
+
 def _parse_hermes_output(raw, stderr=''):
     """Trennt Antworttext und Session-ID aus der Hermes-Ausgabe.
 
@@ -807,6 +874,7 @@ def _parse_hermes_output(raw, stderr=''):
     if not answer:
         log.error(f'Hermes output has no answer text: {(raw or "")[:200]}')
         return None, None
+    answer = _format_hermes_reasoning_block(answer)
     return answer, sid
 
 
@@ -976,7 +1044,7 @@ def _file_note_prefix(files):
 
 
 def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_override=None,
-                          streaming=False):
+                          streaming=False, app_continuation=None):
     """Baut die vollständige CLI-Kommandozeile (Session-, System-Prompt-, Datei- und
     Extra-Parameter) für den konfigurierten Agenten. Gemeinsam genutzt vom
     nicht-streamenden Pfad (call_agent_cli) und vom Streaming-Pfad
@@ -993,7 +1061,16 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     Rückgabe: (cmd, env, cwd, timeout, is_hermes) oder None bei fehlendem cli_command.
     Nebenwirkung: der openclaw-„neue Session"-Zweig ruft store_session_id() (wie zuvor
-    innerhalb von call_agent_cli) — unverändertes Verhalten."""
+    innerhalb von call_agent_cli) — unverändertes Verhalten.
+
+    app_continuation: steuert NUR die Log-Beschriftung ("(App-Fortsetzen)"), nicht
+    das Verhalten — None (Default) fällt auf die alte Heuristik zurück (truthy
+    session_id_override = App-Fortsetzen). Explizit False nötig, wenn
+    session_id_override zwar gesetzt ist, aber NICHT vom App-Request stammt,
+    sondern z.B. von _apply_hermes_reasoning innerhalb desselben Turns frisch
+    erzeugt wurde (call_agent_cli überschreibt session_id_override in dem Fall) —
+    sonst würde eine frisch per "Neues Gespräch" gestartete Session fälschlich als
+    "App-Fortsetzen" geloggt (siehe call_agent_cli)."""
     if not cfg.get('cli_command'):
         log.error('No cli_command configured. Set it via the web backend (Bridge konfigurieren).')
         return None
@@ -1010,7 +1087,8 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     if session_param:
         if resume_id:
-            origin = ' (App-Fortsetzen)' if session_id_override else ''
+            is_app_continuation = bool(session_id_override) if app_continuation is None else app_continuation
+            origin = ' (App-Fortsetzen)' if is_app_continuation else ''
             cmd += [session_param, resume_id]
             log.info(f'Continuing session: {resume_id}{origin}')
         elif is_hermes:
@@ -1196,11 +1274,17 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
     Rückgabe: (answer, session_id) — answer ist None bei Fehler; session_id ist die aus
     dem Output extrahierte ID oder None (kein Feld konfiguriert / nicht vorhanden).
     """
+    # Vor einem möglichen Overwrite unten festhalten, ob DIESER Aufruf wirklich vom
+    # App-Request als Fortsetzung gedacht war — sonst würde eine frisch von
+    # _apply_hermes_reasoning im selben Turn erzeugte Session fälschlich als
+    # "App-Fortsetzen" geloggt (siehe _build_agent_command).
+    app_continuation = bool(session_id_override)
     if _is_hermes_binary(_cli_binary(cfg)) and hermes_reasoning and hermes_reasoning != 'auto':
         resume_id = session_id_override or _current_session_id
         session_id_override = _apply_hermes_reasoning(cfg, hermes_reasoning, resume_id)
 
-    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override)
+    built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override,
+                                  app_continuation=app_continuation)
     if built is None:
         return None, None
     cmd, env, cwd, timeout, is_hermes = built
