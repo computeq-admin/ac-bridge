@@ -799,10 +799,20 @@ def _format_hermes_reasoning_block(answer):
     mit/ohne Tool-Nutzung) nachgeprüft werden."""
     m = _HERMES_REASONING_HEADER_RE.match(answer)
     if not m:
+        if 'Reasoning' in answer[:200]:
+            # Nur loggen, wenn überhaupt ein Hinweis auf eine Reasoning-Box im
+            # Text steckt — sonst würde JEDE ganz normale Antwort (kein Override
+            # aktiv) diese Zeile erzeugen. Repr(), damit Steuerzeichen/exotische
+            # Unicode-Box-Zeichen im Log sichtbar werden statt unsichtbar zu
+            # verschwinden — genau dafür ist diese Diagnose gedacht.
+            log.info(f'_format_hermes_reasoning_block: "Reasoning" im Text, aber Kopfzeile passt nicht. '
+                     f'Erste 200 Zeichen: {answer[:200]!r}')
         return answer
     rest = answer[m.end():]
     paragraphs = re.split(r'\n\s*\n', rest)
     if len(paragraphs) < 2:
+        log.info(f'_format_hermes_reasoning_block: Kopfzeile erkannt, aber kein zweiter Absatz gefunden. '
+                 f'Rest (erste 200 Zeichen): {rest[:200]!r}')
         return answer
 
     def dedupe(text):
@@ -835,10 +845,13 @@ def _format_hermes_reasoning_block(answer):
         final_answer = '\n\n'.join(paragraphs[1:]).strip()
 
     if not reasoning_text or not final_answer:
+        log.info('_format_hermes_reasoning_block: reasoning_text oder final_answer nach Aufteilung leer — unverändert.')
         return answer
 
     cell = reasoning_text.replace('|', '\\|')
     table = f'| Reasoning |\n| --- |\n| {cell} |'
+    log.info(f'_format_hermes_reasoning_block: umformatiert ({len(reasoning_text)} Zeichen Reasoning, '
+              f'{len(final_answer)} Zeichen Antwort).')
     return f'{table}\n\n{final_answer}'
 
 
