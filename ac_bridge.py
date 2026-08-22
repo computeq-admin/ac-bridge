@@ -1199,15 +1199,18 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         claude_model = cfg.get('claude_model', '')
         if claude_model in ('sonnet', 'opus', 'haiku', 'fable'):
             cmd += ['--model', claude_model]
-        # Reasoning-Tri-State (ConfigView.swift/ModelQuickSettingsSheet.swift):
-        # "auto" (Standard) hängt nichts an — die CLI/das Modell entscheidet
-        # selbst. "on" fordert mit --effort high aktiv mehr Reasoning an (kein
-        # harter Zwang, aber der stärkste dokumentierte Hebel für Headless-
-        # Aufrufe — siehe Recherche zu Claude Code CLI). "off" wird weiter unten
-        # über die Env-Var MAX_THINKING_TOKENS=0 umgesetzt (dort verifiziert
-        # als einzig zuverlässiger harter Abschalt-Weg).
-        if cfg.get('claude_reasoning') == 'on':
-            cmd += ['--effort', 'high']
+        # Reasoning-Effort (6 Stufen wie hermes_reasoning): "auto" (Standard)
+        # hängt nichts an — CLI/Modell entscheidet selbst. Sonst direktes
+        # --effort-Flag auf dem eigentlichen Aufruf (siehe Claude Code CLI docs,
+        # code.claude.com/docs/en/cli-reference: "Options: low, medium, high,
+        # xhigh, max, or ultracode. ... Overrides the effortLevel setting for
+        # this session and does not persist") — anders als Hermes' /reasoning
+        # KEIN separater Voraufruf nötig. Defensive Whitelist wie serverseitig
+        # in ios_app_endpoint.php save_bridge_config, falls ein altes/
+        # manipuliertes config.json noch den alten Tri-State-Wert enthält.
+        claude_reasoning = cfg.get('claude_reasoning') or 'auto'
+        if claude_reasoning in ('low', 'medium', 'high', 'xhigh', 'max'):
+            cmd += ['--effort', claude_reasoning]
     elif is_hermes:
         # Bridge-verwaltete Standard-Flags — siehe Modul-Kommentar oben. `streaming`
         # ändert hier (noch) nichts; Hermes-Streaming ist ein separates, späteres
@@ -1244,11 +1247,6 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
-    if is_claude and cfg.get('claude_reasoning') == 'off':
-        # Schaltet Extended Thinking komplett aus (wirkt nicht bei Fable 5, siehe
-        # ConfigView.swift-Kommentar) — Anthropic-eigene Env-Var, kein CLI-Flag
-        # dafür vorhanden.
-        env['MAX_THINKING_TOKENS'] = '0'
     if is_hermes:
         # Profil-Auswahl: HERMES_HOME zeigt auf das Home des gewählten Hermes-Profils.
         env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
