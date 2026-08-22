@@ -1691,6 +1691,13 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='', files
     if session_id:
         store_session_id(session_id)
 
+    # Entgegen der Nous-Research-Doku (API-Server soll Reasoning NICHT im Response
+    # einschließen, siehe call_agent_hermes_streaming-Docstring) hat sich in der
+    # Praxis gezeigt, dass die Reasoning-Box trotzdem als normaler content-Delta-
+    # Text durchgereicht wird, wenn ein Override aktiv ist — dieselbe Aufbereitung
+    # wie im CLI-Pfad (_parse_hermes_output) daher auch hier anwenden.
+    accumulated = _format_hermes_reasoning_block(accumulated)
+
     if on_partial and accumulated != last_posted:
         on_partial(accumulated)
 
