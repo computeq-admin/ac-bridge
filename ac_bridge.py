@@ -808,6 +808,88 @@ def _parse_hermes_output(raw, stderr=''):
     return answer, sid
 
 
+def _extract_hermes_session_id_only(stdout, stderr):
+    """Wie _parse_hermes_output, aber gibt NUR die Session-ID zurück und verlangt
+    KEINEN nicht-leeren Antworttext. Wird für den /reasoning-Vorab-Aufruf gebraucht
+    (siehe _apply_hermes_reasoning) — dessen Bestätigungstext im Quiet-Modus (-Q)
+    leer sein kann; _parse_hermes_output würde dann fälschlich (None, None)
+    liefern und die gerade erst erzeugte Session-ID verwerfen."""
+    last = None
+    for last in _HERMES_SESSION_LINE_RE.finditer(stderr or ''):
+        pass
+    if last:
+        return last.group(1)
+    last = None
+    for last in _HERMES_SESSION_LINE_RE.finditer(stdout or ''):
+        pass
+    if last:
+        return last.group(1)
+    return None
+
+
+# Merkt sich pro Hermes-Session, welches Reasoning-Level dort zuletzt per
+# /reasoning gesetzt wurde — Prozessspeicher, leert sich bei jedem Bridge-
+# Neustart (unproblematisch: eine neue Session hat ohnehin noch keinen
+# gemerkten Wert, siehe _apply_hermes_reasoning). Key ist die Hermes-Session-ID,
+# oder '__new__' für eine noch nicht existierende Session (erster Aufruf einer
+# neuen Unterhaltung mit sofort gesetztem Override).
+_hermes_reasoning_by_session = {}
+
+
+def _apply_hermes_reasoning(cfg, level, resume_id):
+    """Setzt das Reasoning-Level für eine Hermes-Session per In-Chat-Slash-Befehl
+    `/reasoning <level>` (none|minimal|low|medium|high|xhigh|max|ultra) — Hermes
+    hat dafür KEINEN Chat-Zeitpunkt-Flag (siehe `hermes chat --help`), nur diesen
+    interaktiven Befehl, daher ein eigener, vorgeschalteter CLI-Aufruf statt
+    einem zusätzlichen Argument am eigentlichen Nachrichten-Aufruf. Wird nur
+    ausgeführt, wenn der gewünschte Wert vom zuletzt für diese Session gesetzten
+    abweicht (_hermes_reasoning_by_session) — erspart einen weiteren CLI-Aufruf
+    bei jeder Folgenachricht mit unverändertem Level.
+
+    resume_id kann leer sein (noch keine Session) — in dem Fall ERZEUGT dieser
+    Aufruf eine neue Hermes-Session; die daraus extrahierte Session-ID wird
+    zurückgegeben und MUSS vom Aufrufer als session_id_override für den
+    nachfolgenden eigentlichen Nachrichten-Aufruf verwendet werden, sonst würde
+    dieser eine GANZ NEUE (zweite) Session starten statt die gerade erzeugte
+    fortzusetzen.
+
+    Rückgabe: die zu verwendende Session-ID (neu erzeugt oder unverändert
+    resume_id) — auch bei Fehlern/Nichtstun, nie None, damit der Aufrufer immer
+    einfach damit weiterarbeiten kann."""
+    session_key = resume_id or '__new__'
+    if _hermes_reasoning_by_session.get(session_key) == level:
+        return resume_id
+
+    binary = _cli_binary(cfg)
+    if not binary:
+        return resume_id
+    env = os.environ.copy()
+    env.update(cfg.get('cli_env', {}))
+    env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
+    cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
+    cmd = [binary, 'chat', '-Q', '--yolo', '--accept-hooks', '-q', f'/reasoning {level}']
+    session_param = cfg.get('cli_session_id_param', '')
+    if resume_id and session_param:
+        cmd += [session_param, resume_id]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
+    except Exception as e:
+        log.error(f'_apply_hermes_reasoning: {e}')
+        return resume_id
+    if result.returncode != 0:
+        log.error(f'_apply_hermes_reasoning: hermes exited {result.returncode}: {result.stderr[:300]}')
+        return resume_id
+
+    extracted_sid = _extract_hermes_session_id_only(result.stdout.strip(), result.stderr)
+    new_resume_id = extracted_sid or resume_id
+    _hermes_reasoning_by_session[new_resume_id or '__new__'] = level
+    if extracted_sid:
+        store_session_id(extracted_sid)
+    log.info(f'Hermes reasoning set to "{level}" for session {new_resume_id or "(new)"}')
+    return new_resume_id
+
+
 # ─────────────────────────────────────────────
 # System-Prompt-Injection (Backends ohne eigenes System-Prompt-Flag)
 # ─────────────────────────────────────────────
@@ -1080,7 +1162,8 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
     return cmd, env, cwd, timeout, is_hermes
 
 
-def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None):
+def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_override=None,
+                    hermes_reasoning=None):
     """Ruft den KI-Agenten als lokalen CLI-Prozess auf.
 
     Session-Handling:
@@ -1096,9 +1179,24 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
       - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
       - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
 
+    hermes_reasoning: nur bei Hermes relevant, sitzungsgebundener Override
+    (none|minimal|low|medium|high|xhigh|max|ultra), NICHT persistiert — siehe
+    ChatQuickSettings/ModelQuickSettingsSheet.swift. 'auto'/leer = kein Override,
+    Hermes entscheidet selbst. Wird per _apply_hermes_reasoning VOR dem
+    eigentlichen Aufruf gesetzt (eigener CLI-Voraufruf, da Hermes dafür keinen
+    Chat-Zeitpunkt-Flag hat) — erzeugt diese Session dabei gerade erst neu
+    (noch kein session_id_override/_current_session_id vorhanden), wird die neu
+    erzeugte Session-ID hier als session_id_override übernommen, damit der
+    eigentliche Aufruf unten dieselbe Session fortsetzt statt eine zweite,
+    unabhängige zu erzeugen.
+
     Rückgabe: (answer, session_id) — answer ist None bei Fehler; session_id ist die aus
     dem Output extrahierte ID oder None (kein Feld konfiguriert / nicht vorhanden).
     """
+    if _is_hermes_binary(_cli_binary(cfg)) and hermes_reasoning and hermes_reasoning != 'auto':
+        resume_id = session_id_override or _current_session_id
+        session_id_override = _apply_hermes_reasoning(cfg, hermes_reasoning, resume_id)
+
     built = _build_agent_command(cfg, prompt, system_prompt, files, session_id_override)
     if built is None:
         return None, None
@@ -1809,7 +1907,19 @@ def process_wakeup(cfg):
     is_claude_cli    = _is_claude_binary(_cli_binary(cfg))
     is_hermes_cli    = _is_hermes_binary(_cli_binary(cfg))
     is_openclaw_cli  = _is_openclaw_binary(_cli_binary(cfg))
-    hermes_api_cfg   = _hermes_api_server_ready(cfg) if (wants_stream_requested and is_hermes_cli) else None
+    # Sitzungsgebundener Reasoning-Override (Chat-Tab-Schnelleinstellungen, siehe
+    # ModelQuickSettingsSheet.swift/index.php) — 'auto'/leer = kein Override.
+    # NUR über den CLI-Pfad umsetzbar (/reasoning-Slash-Befehl, siehe
+    # _apply_hermes_reasoning) — der Hermes-API-Server/Gateway kennt dieses
+    # Konzept nicht (jedenfalls nicht auf diesem Weg erforscht). Ist ein Override
+    # aktiv, daher bewusst NICHT den schnellen Gateway-Streaming-Pfad probieren,
+    # sondern direkt auf den CLI-Pfad gehen (langsamer, aber garantiert korrekt) —
+    # sonst würde das Reasoning-Level für diese Nachricht schlicht ignoriert.
+    hermes_reasoning = job.get('hermes_reasoning') or 'auto'
+    hermes_reasoning_active = is_hermes_cli and hermes_reasoning != 'auto'
+    hermes_api_cfg   = (_hermes_api_server_ready(cfg)
+                        if (wants_stream_requested and is_hermes_cli and not hermes_reasoning_active)
+                        else None)
     openclaw_api_cfg = _openclaw_streaming_ready(cfg) if (wants_stream_requested and is_openclaw_cli) else None
     wants_stream     = wants_stream_requested and (
         is_claude_cli or hermes_api_cfg is not None or openclaw_api_cfg is not None
@@ -1889,12 +1999,12 @@ def process_wakeup(cfg):
             log.warning(f'Job #{job_id}: streaming failed — falling back to non-streaming run.')
             answer, new_session_id = call_agent_cli(
                 cfg, prompt, system_prompt, files=downloaded_files or None,
-                session_id_override=job_session_id,
+                session_id_override=job_session_id, hermes_reasoning=hermes_reasoning,
             )
     else:
         answer, new_session_id = call_agent_cli(
             cfg, prompt, system_prompt, files=downloaded_files or None,
-            session_id_override=job_session_id,
+            session_id_override=job_session_id, hermes_reasoning=hermes_reasoning,
         )
 
     if answer:
