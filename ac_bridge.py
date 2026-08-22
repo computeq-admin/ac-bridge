@@ -1310,6 +1310,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
     session_id_field = cfg.get('cli_session_id_output_field', '')
 
     log.info(f'Calling CLI agent: {cmd[0]} (timeout={timeout}s, cwd={cwd})')
+    log.info(f'CLI args: {cmd[1:]}')
     try:
         result = subprocess.run(
             cmd,
@@ -1438,6 +1439,7 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
     session_id_field = cfg.get('cli_session_id_output_field', '')
 
     log.info(f'Calling CLI agent (streaming): {cmd[0]} (timeout={timeout}s, cwd={cwd})')
+    log.info(f'CLI args: {cmd[1:]}')
 
     try:
         proc = subprocess.Popen(
