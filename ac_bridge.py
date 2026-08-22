@@ -1468,7 +1468,7 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
 
 
 def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='', files=None,
-                                session_id_override=None, on_partial=None):
+                                session_id_override=None, on_partial=None, reasoning=None):
     """Streaming über Hermes' eigenen OpenAI-kompatiblen API-Server (siehe
     _hermes_api_server_ready) — komplett anderer Weg als bei Claude: kein
     CLI-Subprozess, sondern ein einzelner HTTP-Call an /v1/chat/completions mit
@@ -1479,6 +1479,18 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='', files
     CLI-Fallback vor den Prompt gesetzt (siehe _file_note_prefix). Ehemals
     wurde bei Anhang komplett auf den CLI-Pfad ausgewichen — seit dieser
     Ergänzung kann auch der Streaming-Pfad Anhänge verarbeiten.
+
+    reasoning: persistenter Override (none|minimal|low|medium|high|xhigh|max|
+    ultra), 'auto'/None = kein Override. Laut Doku (docs.hermes-agent.
+    nousresearch.com/docs/user-guide/features/api-server, "Per-request model
+    selection") akzeptiert der Endpunkt ein "model_options": {"reasoning_effort":
+    "..."}-Feld — NICHT live gegen eine echte Instanz mit stream=true verifiziert
+    (Stand 2026-08-22). Bewusst kein zusätzlicher Korrektheits-Check: geht der
+    Server mit dem Feld schief oder ignoriert es, liefert er trotzdem eine
+    Antwort zurück, die dann ungeprüft übernommen wird — anders als bei einem
+    harten Fehler (Exception/leerer Text unten), der wie gehabt auf den
+    CLI-Pfad (mit /reasoning-Vorab-Aufruf, siehe _apply_hermes_reasoning)
+    zurückfällt.
 
     Live verifiziert 2026-07-26 gegen eine echte Instanz (Kalender-MCP-Nutzung):
     OpenAI-Chat-Completions-SSE-Format ("data: {...}"-Frames, choices[0].delta.
@@ -1524,11 +1536,16 @@ def call_agent_hermes_streaming(cfg, server_cfg, prompt, system_prompt='', files
     last_post = 0.0
     last_posted = None
 
-    log.info(f'Calling Hermes API server (streaming): {url}')
+    body = {'messages': messages, 'stream': True}
+    if reasoning and reasoning != 'auto':
+        body['model_options'] = {'reasoning_effort': reasoning}
+
+    log.info(f'Calling Hermes API server (streaming): {url}'
+             + (f' [reasoning_effort={reasoning}]' if reasoning and reasoning != 'auto' else ''))
 
     try:
         with requests.post(url, headers=headers,
-                            json={'messages': messages, 'stream': True},
+                            json=body,
                             stream=True, timeout=timeout) as resp:
             if resp.status_code != 200:
                 log.error(f'Hermes API server returned HTTP {resp.status_code}')
@@ -1912,17 +1929,17 @@ def process_wakeup(cfg):
     is_openclaw_cli  = _is_openclaw_binary(_cli_binary(cfg))
     # Reasoning-Level, persistent am Profil (ConfigView.swift/settings.php UND
     # ModelQuickSettingsSheet.swift/index.php binden an denselben Wert, wie
-    # hermes_model) — 'auto' = kein Override. NUR über den CLI-Pfad umsetzbar
-    # (/reasoning-Slash-Befehl, siehe _apply_hermes_reasoning) — der Hermes-API-
-    # Server/Gateway kennt dieses Konzept nicht (jedenfalls nicht auf diesem Weg
-    # erforscht). Ist ein Override aktiv, daher bewusst NICHT den schnellen
-    # Gateway-Streaming-Pfad probieren, sondern direkt auf den CLI-Pfad gehen
-    # (langsamer, aber garantiert korrekt) — sonst würde das Reasoning-Level
-    # schlicht ignoriert.
+    # hermes_model) — 'auto' = kein Override. Bei aktivem Override wird der
+    # Gateway-Streaming-Pfad TROTZDEM probiert (call_agent_hermes_streaming
+    # hängt dann "model_options": {"reasoning_effort": ...} an den Request —
+    # laut Doku vom Server unterstützt, siehe dortigen Kommentar zum
+    # Verifikationsstand). Schlägt der Streaming-Call fehl (Exception/HTTP-
+    # Fehler/leerer Text), greift wie gehabt der CLI-Fallback unten mit
+    # /reasoning-Vorab-Aufruf (_apply_hermes_reasoning) — das bleibt der
+    # garantiert korrekte Pfad, falls model_options doch nicht wirkt.
     hermes_reasoning = cfg.get('hermes_reasoning') or 'auto'
-    hermes_reasoning_active = is_hermes_cli and hermes_reasoning != 'auto'
     hermes_api_cfg   = (_hermes_api_server_ready(cfg)
-                        if (wants_stream_requested and is_hermes_cli and not hermes_reasoning_active)
+                        if (wants_stream_requested and is_hermes_cli)
                         else None)
     openclaw_api_cfg = _openclaw_streaming_ready(cfg) if (wants_stream_requested and is_openclaw_cli) else None
     wants_stream     = wants_stream_requested and (
@@ -1991,6 +2008,7 @@ def process_wakeup(cfg):
                 cfg, hermes_api_cfg, prompt, system_prompt, files=downloaded_files or None,
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
+                reasoning=hermes_reasoning,
             )
         else:
             log.info(f'Job #{job_id}: streaming enabled (OpenClaw gateway)')
