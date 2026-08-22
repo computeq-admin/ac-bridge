@@ -786,17 +786,19 @@ def _format_hermes_reasoning_block(answer):
     bereits nativ (iOS: MarkdownTableView über splitMarkdownSegments, Web:
     renderMarkdown) — keine Client-Änderung nötig.
 
-    NUR AN EINEM EINZIGEN Beispiel kalibriert (2026-08-22): dort erschien der
+    Kalibriert an zwei echten Beispielen (2026-08-22): in BEIDEN erschien der
     Reasoning-Text durch ein Live-Redraw-Artefakt zweimal direkt hintereinander
-    (einmal unregelmäßig über mehrere Absätze umgebrochen, einmal als sauberer
-    Absatz). Diese Funktion sucht deshalb zuerst nach einer Selbstverkettung über
-    eine wachsende Zahl führender, durch Leerzeilen getrennter Absätze; findet sie
-    keine (z.B. weil Hermes das Redraw-Artefakt behebt oder bei kürzerem Reasoning
-    gar nicht auftritt), nimmt sie ersatzweise nur den ersten Absatz als Reasoning
-    und alles danach als Antwort. Liefert bei jeder Unsicherheit (kein zweiter
-    Absatz nach der Kopfzeile) den Text UNVERÄNDERT zurück — lieber unformatiert
-    als falsch zerschnitten. MUSS nach dem Deploy an echten Antworten (kurz/lang,
-    mit/ohne Tool-Nutzung) nachgeprüft werden."""
+    (einmal unregelmäßig umgebrochen, einmal als saubere Kopie) — aber OHNE
+    verlässlichen Absatztrenner (mal Leerzeile, mal einzelner Zeilenumbruch, mal
+    GAR KEIN Trenner zwischen den beiden Kopien). Ein absatzbasierter Split
+    (frühere Version dieser Funktion) versagte deshalb beim zweiten Beispiel.
+    Robuster Ersatz: sucht direkt nach der kürzesten selbstverkettenden
+    Textwiederholung (whitespace-normalisiert) am Anfang von `rest`, unabhängig
+    von Zeilenumbrüchen — die Grenze wird über eine Normalisierungs-Index-
+    Abbildung zurück auf die Roh-Position gemappt, ab der der Rest (die
+    eigentliche Antwort) beginnt. Liefert bei jeder Unsicherheit (keine
+    Wiederholung gefunden) den Text UNVERÄNDERT zurück — lieber unformatiert als
+    falsch zerschnitten. MUSS an weiteren echten Antworten nachgeprüft werden."""
     m = _HERMES_REASONING_HEADER_RE.match(answer)
     if not m:
         if 'Reasoning' in answer[:200]:
@@ -809,43 +811,46 @@ def _format_hermes_reasoning_block(answer):
                      f'Erste 200 Zeichen: {answer[:200]!r}')
         return answer
     rest = answer[m.end():]
-    paragraphs = re.split(r'\n\s*\n', rest)
-    if len(paragraphs) < 2:
-        log.info(f'_format_hermes_reasoning_block: Kopfzeile erkannt, aber kein zweiter Absatz gefunden. '
-                 f'Rest (erste 200 Zeichen): {rest[:200]!r}')
-        return answer
 
-    def dedupe(text):
-        normalized = re.sub(r'\s+', ' ', text).strip()
-        n = len(normalized)
-        for half in (n // 2, (n + 1) // 2, (n - 1) // 2):
-            if half <= 10 or half >= n:
-                continue
-            first, second = normalized[:half].strip(), normalized[half:].strip()
-            if first and first == second:
-                return first
-        return normalized
+    # Whitespace-normalisierte Kopie MIT Index-Abbildung zurück auf `rest` —
+    # normalized[i] entspricht rest[:index_map[i]] (index_map[i] = Roh-Position
+    # direkt NACH dem Zeichen/der Whitespace-Lücke, die normalized[i] erzeugt hat).
+    norm_chars = []
+    index_map = []
+    i = 0
+    n_rest = len(rest)
+    while i < n_rest:
+        c = rest[i]
+        if c.isspace():
+            j = i
+            while j < n_rest and rest[j].isspace():
+                j += 1
+            if norm_chars and norm_chars[-1] != ' ':
+                norm_chars.append(' ')
+                index_map.append(j)
+            i = j
+        else:
+            norm_chars.append(c)
+            i += 1
+            index_map.append(i)
+    normalized = ''.join(norm_chars).strip()
+    n = len(normalized)
 
     reasoning_text = None
     final_answer = None
-    for split_at in range(1, len(paragraphs)):
-        candidate = '\n\n'.join(paragraphs[:split_at])
-        deduped = dedupe(candidate)
-        # Nur als Treffer werten, wenn dedupe() wirklich etwas GEKÜRZT hat (echte
-        # Selbstverkettung erkannt) — sonst wäre jeder beliebige Split "ein Treffer".
-        if len(deduped) < len(re.sub(r'\s+', ' ', candidate).strip()):
-            reasoning_text = deduped
-            final_answer = '\n\n'.join(paragraphs[split_at:]).strip()
+    for k in range(20, n // 2 + 1):
+        if normalized[k - 1] == ' ':
+            continue  # Wortgrenze bevorzugen, nicht mitten im Wort splitten
+        if normalized[:k] == normalized[k:2 * k]:
+            reasoning_text = normalized[:k]
+            end_idx = min(2 * k, len(index_map)) - 1
+            original_end = index_map[end_idx] if end_idx >= 0 else 0
+            final_answer = rest[original_end:].strip()
             break
 
-    if reasoning_text is None:
-        # Kein Duplikations-Artefakt gefunden — einfacher Fall: erster Absatz ist
-        # das Reasoning, Rest die Antwort.
-        reasoning_text = re.sub(r'\s+', ' ', paragraphs[0]).strip()
-        final_answer = '\n\n'.join(paragraphs[1:]).strip()
-
-    if not reasoning_text or not final_answer:
-        log.info('_format_hermes_reasoning_block: reasoning_text oder final_answer nach Aufteilung leer — unverändert.')
+    if reasoning_text is None or not final_answer:
+        log.info(f'_format_hermes_reasoning_block: Kopfzeile erkannt, aber keine Selbstwiederholung gefunden. '
+                 f'Normalisierter Rest (erste 300 Zeichen): {normalized[:300]!r}')
         return answer
 
     cell = reasoning_text.replace('|', '\\|')
@@ -1330,6 +1335,11 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
 
         extracted_sid = None
         if is_hermes:
+            # Diagnose für _format_hermes_reasoning_block (Trennmuster Reasoning/
+            # Antwort variiert von Fall zu Fall, siehe dortiger Kommentar) — repr(),
+            # damit Zeilenumbrüche/Whitespace sichtbar bleiben statt im Log optisch
+            # zu verschwinden. Bewusst großzügig (1500 Zeichen), nicht nur 200-300.
+            log.info(f'Hermes raw stdout (repr, erste 1500 Zeichen): {raw[:1500]!r}')
             # Hermes: zeilenbasiert (kein JSON). Antwort steht auf stdout, die
             # session_id-Zeile auf stderr — beides übergeben (siehe Funktions-Doku).
             answer, extracted_sid = _parse_hermes_output(raw, result.stderr)
