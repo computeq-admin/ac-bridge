@@ -197,13 +197,15 @@ def apply_config_update(cfg):
 
     # Diese Felder werden an jeder Aufrufstelle frisch aus cfg gelesen (kein
     # Caching, kein Prozess-Zustand, der einen Neustart bräuchte — siehe
-    # _build_agent_command: cfg.get('hermes_model', '')) — ein Modell-/
-    # Favoriten-Wechsel soll sofort mit dem NÄCHSTEN Job wirken, nicht erst
-    # nach einem Neustart. Der Neustart verzögert außerdem den nächsten Job um
-    # mehrere Sekunden, wodurch Hermes' eigene gateway_state.json währenddessen
-    # "stale" werden kann (siehe _hermes_api_server_own_process) — der
-    # API-Server-Streaming-Pfad fällt dann unnötig auf CLI zurück.
-    RESTART_NOT_NEEDED_KEYS = {'hermes_model', 'hermes_favorite_models'}
+    # _build_agent_command: cfg.get('hermes_model', '') bzw. call_agent_cli:
+    # hermes_reasoning-Parameter aus cfg.get('hermes_reasoning', 'auto')) — ein
+    # Modell-/Favoriten-/Reasoning-Wechsel soll sofort mit dem NÄCHSTEN Job
+    # wirken, nicht erst nach einem Neustart. Der Neustart verzögert außerdem
+    # den nächsten Job um mehrere Sekunden, wodurch Hermes' eigene
+    # gateway_state.json währenddessen "stale" werden kann (siehe
+    # _hermes_api_server_own_process) — der API-Server-Streaming-Pfad fällt
+    # dann unnötig auf CLI zurück.
+    RESTART_NOT_NEEDED_KEYS = {'hermes_model', 'hermes_favorite_models', 'hermes_reasoning'}
     restart_relevant_keys = [k for k in updated_keys if k not in RESTART_NOT_NEEDED_KEYS]
 
     service_name = cfg.get('service_name', '')
@@ -1179,9 +1181,10 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
       - cli_file_param gesetzt (z.B. --add-file): jede Datei als eigenes Flag-Paar
       - cli_file_param leer: Dateipfade werden dem Prompt vorangestellt
 
-    hermes_reasoning: nur bei Hermes relevant, sitzungsgebundener Override
-    (none|minimal|low|medium|high|xhigh|max|ultra), NICHT persistiert — siehe
-    ChatQuickSettings/ModelQuickSettingsSheet.swift. 'auto'/leer = kein Override,
+    hermes_reasoning: nur bei Hermes relevant, persistent am Profil gesetzter
+    Override (none|minimal|low|medium|high|xhigh|max|ultra, ac_profiles.
+    hermes_reasoning) — bleibt bis der User ihn wieder auf 'auto' stellt.
+    'auto'/leer = kein Override,
     Hermes entscheidet selbst. Wird per _apply_hermes_reasoning VOR dem
     eigentlichen Aufruf gesetzt (eigener CLI-Voraufruf, da Hermes dafür keinen
     Chat-Zeitpunkt-Flag hat) — erzeugt diese Session dabei gerade erst neu
@@ -1907,15 +1910,16 @@ def process_wakeup(cfg):
     is_claude_cli    = _is_claude_binary(_cli_binary(cfg))
     is_hermes_cli    = _is_hermes_binary(_cli_binary(cfg))
     is_openclaw_cli  = _is_openclaw_binary(_cli_binary(cfg))
-    # Sitzungsgebundener Reasoning-Override (Chat-Tab-Schnelleinstellungen, siehe
-    # ModelQuickSettingsSheet.swift/index.php) — 'auto'/leer = kein Override.
-    # NUR über den CLI-Pfad umsetzbar (/reasoning-Slash-Befehl, siehe
-    # _apply_hermes_reasoning) — der Hermes-API-Server/Gateway kennt dieses
-    # Konzept nicht (jedenfalls nicht auf diesem Weg erforscht). Ist ein Override
-    # aktiv, daher bewusst NICHT den schnellen Gateway-Streaming-Pfad probieren,
-    # sondern direkt auf den CLI-Pfad gehen (langsamer, aber garantiert korrekt) —
-    # sonst würde das Reasoning-Level für diese Nachricht schlicht ignoriert.
-    hermes_reasoning = job.get('hermes_reasoning') or 'auto'
+    # Reasoning-Level, persistent am Profil (ConfigView.swift/settings.php UND
+    # ModelQuickSettingsSheet.swift/index.php binden an denselben Wert, wie
+    # hermes_model) — 'auto' = kein Override. NUR über den CLI-Pfad umsetzbar
+    # (/reasoning-Slash-Befehl, siehe _apply_hermes_reasoning) — der Hermes-API-
+    # Server/Gateway kennt dieses Konzept nicht (jedenfalls nicht auf diesem Weg
+    # erforscht). Ist ein Override aktiv, daher bewusst NICHT den schnellen
+    # Gateway-Streaming-Pfad probieren, sondern direkt auf den CLI-Pfad gehen
+    # (langsamer, aber garantiert korrekt) — sonst würde das Reasoning-Level
+    # schlicht ignoriert.
+    hermes_reasoning = cfg.get('hermes_reasoning') or 'auto'
     hermes_reasoning_active = is_hermes_cli and hermes_reasoning != 'auto'
     hermes_api_cfg   = (_hermes_api_server_ready(cfg)
                         if (wants_stream_requested and is_hermes_cli and not hermes_reasoning_active)
