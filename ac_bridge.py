@@ -1022,6 +1022,14 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
         # ändert hier (noch) nichts; Hermes-Streaming ist ein separates, späteres
         # Vorhaben über den Hermes-API-Server, nicht über diesen CLI-Aufruf.
         cmd += ['-Q', '--yolo', '--accept-hooks']
+        # Modellwechsel (ConfigView.swift/index.php, Favoriten-UI): -m/--model ist
+        # ein reiner Chat-Zeitpunkt-Flag (siehe `hermes chat --help`) — KEINE
+        # Mutation der Hermes-eigenen config.yaml nötig (kein `config set
+        # model.default ...`). Leer/ungesetzt → Hermes bleibt beim eigenen, im
+        # Profil hinterlegten Default.
+        hermes_model = cfg.get('hermes_model', '')
+        if hermes_model:
+            cmd += ['-m', hermes_model]
     elif is_openclaw:
         cmd.append('--json')
 
@@ -2476,6 +2484,75 @@ def send_hermes_profiles(cfg):
         log.error(f'send_hermes_profiles: post failed: {e}')
 
 
+def _normalize_hermes_models(data):
+    """Normalisiert provider_models_cache.json in eine einheitliche Liste
+    [{'id': ..., 'name': ...}] — die genaue Rohform der Datei war beim Schreiben
+    dieser Funktion nicht bekannt, daher robust gegen mehrere plausible Formen:
+    Liste von Strings, Liste von Dicts mit 'id'/'model'/'slug'/'name', oder ein
+    Dict keyed by Modell-ID (ggf. unter einem Hüllenschlüssel wie "models")."""
+    if isinstance(data, dict):
+        if 'models' in data and isinstance(data['models'], (list, dict)):
+            return _normalize_hermes_models(data['models'])
+        models = []
+        for key, value in data.items():
+            if isinstance(value, dict):
+                model_id = value.get('id') or value.get('model') or key
+                name = value.get('name') or value.get('display_name') or model_id
+            else:
+                model_id = key
+                name = str(value) if value else key
+            if model_id:
+                models.append({'id': model_id, 'name': name})
+        return models
+    if isinstance(data, list):
+        models = []
+        for entry in data:
+            if isinstance(entry, str):
+                models.append({'id': entry, 'name': entry})
+            elif isinstance(entry, dict):
+                model_id = entry.get('id') or entry.get('model') or entry.get('slug') or ''
+                name = entry.get('name') or entry.get('display_name') or model_id
+                if model_id:
+                    models.append({'id': model_id, 'name': name})
+        return models
+    return []
+
+
+def send_hermes_models(cfg):
+    """Liest provider_models_cache.json aus dem Home des AKTUELL AKTIVEN
+    Hermes-Profils (reiner Dateizugriff, kein Subprocess nötig) und schickt die
+    Modelle an den Server. Wird via MQTT action=list-hermes-models ausgelöst
+    (App: Modell-Auswahl). Kommt die Liste leer an, im Log nachsehen, welche
+    Rohform die Datei tatsächlich hat — _normalize_hermes_models() ggf. anpassen."""
+    models = []
+    try:
+        cache_path = Path(_hermes_home_for(cfg.get('hermes_profile', ''))) / 'provider_models_cache.json'
+        if cache_path.is_file():
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            models = _normalize_hermes_models(raw)
+        else:
+            log.warning(f'send_hermes_models: {cache_path} not found')
+    except Exception as e:
+        log.error(f'send_hermes_models: {e}')
+    try:
+        r = requests.post(
+            cfg['server_url'] + '/put_bridge_hermes_models.php',
+            json={'token_b': cfg['token_b'], 'models': models},
+            timeout=20,
+        )
+        data = r.json()
+        if 'token_b_new' in data:
+            cfg['token_b'] = data['token_b_new']
+            save_config(cfg)
+        if data.get('status') == 'ok':
+            log.info(f'Hermes models sent ({len(models)})')
+        else:
+            log.error(f'send_hermes_models: server rejected (HTTP {r.status_code}): {data}')
+    except Exception as e:
+        log.error(f'send_hermes_models: post failed: {e}')
+
+
 # --- Dispatch (Backend anhand cli_command wählen) ---
 
 def _history_session_files(cfg):
@@ -2721,6 +2798,8 @@ def on_message(client, userdata, msg):
         send_session_file(cfg, payload.get('file_path', ''))
     elif action == 'list-hermes-profiles':
         send_hermes_profiles(cfg)
+    elif action == 'list-hermes-models':
+        send_hermes_models(cfg)
     else:
         log.warning(f'Unknown MQTT action: {action}')
 
