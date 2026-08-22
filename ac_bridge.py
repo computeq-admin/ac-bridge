@@ -2486,7 +2486,11 @@ def send_hermes_profiles(cfg):
 
 def _normalize_hermes_models(data):
     """Normalisiert provider_models_cache.json in eine einheitliche Liste
-    [{'id': ..., 'name': ...}]. Tatsächliche Struktur (per Nutzer-Testdatei
+    [{'id': ..., 'name': ..., 'provider': ...}]. 'provider' ist der
+    provider_models_cache.json-Schlüssel (z.B. "openrouter"/"anthropic"),
+    damit die App/Web-UI anzeigen kann, über welchen Zugang ein Modell
+    erreichbar ist — sonst nicht aus der (teils bereits vendor-qualifizierten)
+    'id' allein ablesbar. Tatsächliche Struktur (per Nutzer-Testdatei
     bestätigt): {"<provider>": {"fp": ..., "at": ..., "models": ["<id>", ...]},
     ...} — z.B. {"openrouter": {"models": ["anthropic/claude-opus-5", ...]},
     "anthropic": {"models": ["claude-opus-4-8", ...]}}. Modelle unter dem
@@ -2516,7 +2520,7 @@ def _normalize_hermes_models(data):
             if model_id in seen:
                 continue
             seen.add(model_id)
-            models.append({'id': model_id, 'name': model_id})
+            models.append({'id': model_id, 'name': model_id, 'provider': provider_key})
     return models
 
 
