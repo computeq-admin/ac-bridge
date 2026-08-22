@@ -2486,36 +2486,38 @@ def send_hermes_profiles(cfg):
 
 def _normalize_hermes_models(data):
     """Normalisiert provider_models_cache.json in eine einheitliche Liste
-    [{'id': ..., 'name': ...}] — die genaue Rohform der Datei war beim Schreiben
-    dieser Funktion nicht bekannt, daher robust gegen mehrere plausible Formen:
-    Liste von Strings, Liste von Dicts mit 'id'/'model'/'slug'/'name', oder ein
-    Dict keyed by Modell-ID (ggf. unter einem Hüllenschlüssel wie "models")."""
-    if isinstance(data, dict):
-        if 'models' in data and isinstance(data['models'], (list, dict)):
-            return _normalize_hermes_models(data['models'])
-        models = []
-        for key, value in data.items():
-            if isinstance(value, dict):
-                model_id = value.get('id') or value.get('model') or key
-                name = value.get('name') or value.get('display_name') or model_id
-            else:
-                model_id = key
-                name = str(value) if value else key
-            if model_id:
-                models.append({'id': model_id, 'name': name})
-        return models
-    if isinstance(data, list):
-        models = []
-        for entry in data:
-            if isinstance(entry, str):
-                models.append({'id': entry, 'name': entry})
-            elif isinstance(entry, dict):
-                model_id = entry.get('id') or entry.get('model') or entry.get('slug') or ''
-                name = entry.get('name') or entry.get('display_name') or model_id
-                if model_id:
-                    models.append({'id': model_id, 'name': name})
-        return models
-    return []
+    [{'id': ..., 'name': ...}]. Tatsächliche Struktur (per Nutzer-Testdatei
+    bestätigt): {"<provider>": {"fp": ..., "at": ..., "models": ["<id>", ...]},
+    ...} — z.B. {"openrouter": {"models": ["anthropic/claude-opus-5", ...]},
+    "anthropic": {"models": ["claude-opus-4-8", ...]}}. Modelle unter dem
+    Meta-Provider "openrouter" sind bereits vendor-qualifiziert (enthalten
+    "/"); Modelle unter einem direkten Provider (z.B. "anthropic") sind bare
+    Namen und werden hier mit dem Provider-Schlüssel präfixiert, damit das
+    Ergebnis IMMER im von `hermes chat -m` erwarteten "<provider>/<model>"-
+    Format vorliegt (siehe Beispiel "anthropic/claude-sonnet-4" in
+    `hermes chat --help`). Dasselbe Modell taucht oft doppelt auf (einmal
+    vendor-qualifiziert über "openrouter", einmal bare unter seinem direkten
+    Provider) — Ergebnis wird daher über die finale ID dedupliziert, erste
+    Fundstelle gewinnt (Reihenfolge der provider_models_cache.json-Keys)."""
+    if not isinstance(data, dict):
+        return []
+    seen = set()
+    models = []
+    for provider_key, provider_value in data.items():
+        if not isinstance(provider_value, dict):
+            continue
+        raw_models = provider_value.get('models')
+        if not isinstance(raw_models, list):
+            continue
+        for entry in raw_models:
+            if not isinstance(entry, str) or not entry:
+                continue
+            model_id = entry if '/' in entry else f'{provider_key}/{entry}'
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            models.append({'id': model_id, 'name': model_id})
+    return models
 
 
 def send_hermes_models(cfg):
