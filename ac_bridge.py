@@ -195,8 +195,19 @@ def apply_config_update(cfg):
     else:
         log.info('update-config: no changes applied')
 
+    # Diese Felder werden an jeder Aufrufstelle frisch aus cfg gelesen (kein
+    # Caching, kein Prozess-Zustand, der einen Neustart bräuchte — siehe
+    # _build_agent_command: cfg.get('hermes_model', '')) — ein Modell-/
+    # Favoriten-Wechsel soll sofort mit dem NÄCHSTEN Job wirken, nicht erst
+    # nach einem Neustart. Der Neustart verzögert außerdem den nächsten Job um
+    # mehrere Sekunden, wodurch Hermes' eigene gateway_state.json währenddessen
+    # "stale" werden kann (siehe _hermes_api_server_own_process) — der
+    # API-Server-Streaming-Pfad fällt dann unnötig auf CLI zurück.
+    RESTART_NOT_NEEDED_KEYS = {'hermes_model', 'hermes_favorite_models'}
+    restart_relevant_keys = [k for k in updated_keys if k not in RESTART_NOT_NEEDED_KEYS]
+
     service_name = cfg.get('service_name', '')
-    if service_name and updated_keys:
+    if service_name and restart_relevant_keys:
         log.info(f'Restarting service: {service_name}')
         try:
             subprocess.run(
