@@ -781,10 +781,12 @@ _HERMES_REASONING_HEADER_RE = re.compile(r'^\s*┌─\s*Reasoning\b[^\n]*┐\s*\
 def _format_hermes_reasoning_block(answer):
     """Formt Hermes' 'Reasoning'-Panel-Ausgabe (Box-Kopfzeile ┌─ Reasoning ─...─┐,
     OHNE schließende Boxkante beim Pipe-Capture — kein echtes TTY, siehe
-    call_agent_cli) in eine einspaltige/einzeilige Markdown-Tabelle vor der
-    eigentlichen Antwort um (Nutzerwunsch). Beide Apps rendern GFM-Pipe-Tabellen
-    bereits nativ (iOS: MarkdownTableView über splitMarkdownSegments, Web:
-    renderMarkdown) — keine Client-Änderung nötig.
+    call_agent_cli) in einen fett beschrifteten, normal fließenden Absatz vor der
+    eigentlichen Antwort um ("**🧠 Reasoning:** ...") — Nutzerwunsch nach einer
+    ERSTEN Version mit einzelliger Markdown-Tabelle: die zwang den ganzen
+    Reasoning-Text in eine Tabellenzelle (Scrollen statt normalem Zeilenumbruch),
+    das hier vermeidet das komplett. Bold wird auf beiden Plattformen bereits
+    ohne jede Client-Änderung korrekt gerendert.
 
     Kalibriert an zwei echten Beispielen (2026-08-22): in BEIDEN erschien der
     Reasoning-Text durch ein Live-Redraw-Artefakt zweimal direkt hintereinander
@@ -853,11 +855,9 @@ def _format_hermes_reasoning_block(answer):
                  f'Normalisierter Rest (erste 300 Zeichen): {normalized[:300]!r}')
         return answer
 
-    cell = reasoning_text.replace('|', '\\|')
-    table = f'| Reasoning |\n| --- |\n| {cell} |'
     log.info(f'_format_hermes_reasoning_block: umformatiert ({len(reasoning_text)} Zeichen Reasoning, '
               f'{len(final_answer)} Zeichen Antwort).')
-    return f'{table}\n\n{final_answer}'
+    return f'**🧠 Reasoning:** {reasoning_text}\n\n{final_answer}'
 
 
 def _parse_hermes_output(raw, stderr=''):
