@@ -1304,6 +1304,7 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
     if built is None:
         return None, None
     cmd, env, cwd, timeout, is_hermes = built
+    is_claude = _is_claude_binary(cmd[0])
     # _build_agent_command berechnet session_id_field nur für seinen eigenen internen
     # Gebrauch (Resume-Entscheidung) und gibt es nicht zurück — hier unten aber für die
     # JSON-Antwort-Auswertung erneut benötigt. Reiner cfg-Read, keine Nebenwirkung.
@@ -1367,6 +1368,18 @@ def call_agent_cli(cfg, prompt, system_prompt='', files=None, session_id_overrid
                     return None, None
             else:
                 answer = raw
+
+        if is_claude and extracted_sid:
+            jsonl_answer = _claude_extract_last_answer(cfg, extracted_sid)
+            if jsonl_answer is None:
+                log.info(f'Claude diag (non-streaming): JSONL-Extraktion leer/fehlgeschlagen '
+                         f'für Session {extracted_sid}.')
+            elif jsonl_answer != answer:
+                log.info(f'Claude diag (non-streaming) session {extracted_sid} — Texte weichen ab:\n'
+                         f'  CLI-result: {answer!r}\n'
+                         f'  JSONL:      {jsonl_answer!r}')
+            else:
+                log.info(f'Claude diag (non-streaming) session {extracted_sid}: Texte identisch.')
 
         log.info(f'CLI answered ({len(answer)} chars)')
         return answer, extracted_sid
@@ -1563,6 +1576,16 @@ def call_agent_cli_streaming(cfg, prompt, system_prompt='', files=None,
         return None, None
 
     if extracted_sid:
+        jsonl_answer = _claude_extract_last_answer(cfg, extracted_sid)
+        if jsonl_answer is None:
+            log.info(f'Claude diag (streaming): JSONL-Extraktion leer/fehlgeschlagen '
+                     f'für Session {extracted_sid}.')
+        elif jsonl_answer != final_answer:
+            log.info(f'Claude diag (streaming) session {extracted_sid} — Texte weichen ab:\n'
+                     f'  CLI-result: {final_answer!r}\n'
+                     f'  JSONL:      {jsonl_answer!r}')
+        else:
+            log.info(f'Claude diag (streaming) session {extracted_sid}: Texte identisch.')
         store_session_id(extracted_sid)
 
     # Vollständigen Text ein letztes Mal posten (nahtloser Übergang zur put_answer,
@@ -2211,6 +2234,26 @@ def _claude_session_files(cfg):
     if not d.is_dir():
         return []
     return sorted(d.glob('*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _claude_extract_last_answer(cfg, session_id):
+    """Liest die zuletzt geschriebene Assistant-Antwort für session_id direkt aus der
+    JSONL-Transkriptdatei — dieselbe Extraktion wie im Verlauf (_read_claude_detail/
+    _claude_extract_text). Nur für Diagnose-Vergleich gegen das CLI-eigene 'result'-Feld
+    (siehe call_agent_cli/call_agent_cli_streaming) — noch KEINE Verhaltensänderung.
+    None bei fehlender/leerer/nicht lesbarer Datei."""
+    if not session_id:
+        return None
+    path = _claude_project_dir(cfg) / f'{session_id}.jsonl'
+    if not path.is_file():
+        return None
+    messages = _read_claude_detail(path)
+    if not messages:
+        return None
+    for m in reversed(messages):
+        if m['role'] == 'agent':
+            return m['content'] or None
+    return None
 
 
 def _read_claude_summary(path):
