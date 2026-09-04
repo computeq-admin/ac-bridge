@@ -2964,35 +2964,45 @@ def _read_openclaw_detail(path):
 # analog zu sessions.create/chat.send in call_agent_openclaw_gateway().
 
 def _openclaw_gateway_history_list(server_cfg):
+    """sessions.list liefert KEIN Titel-/Vorschau-Feld (live bestätigt
+    2026-09-04 — nur Metadaten wie Token-Zahlen, Modell, Timestamps, kein
+    displayName/label/lastMessage). Für einen sinnvollen Bezug in der Liste
+    wird pro Session zusätzlich die letzte Nachricht per chat.history geholt
+    — über DIESELBE offene Verbindung (kein erneuter Handshake pro Session,
+    nur ein zusätzlicher req/res-Roundtrip)."""
     ws = None
     try:
         ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
         if not ok:
             return []
         ok, payload = _openclaw_ws_call(ws, 'sessions.list', {'limit': 50}, deadline)
         if not ok:
             return []
-        # Format-Diagnose: zeigt, ob sessions.list schon ein Vorschau-/Titel-
-        # Feld mitliefert (letzte Nachricht o.ä.), bevor wir dafür extra
-        # chat.history-Aufrufe pro Session einbauen.
-        raw_sessions = (payload or {}).get('sessions') or []
-        if raw_sessions:
-            log.info(f'OpenClaw gateway: sessions.list Rohdaten (Format-Diagnose): {raw_sessions[:2]}')
         entries = []
-        for s in raw_sessions:
+        for s in (payload or {}).get('sessions') or []:
             key = s.get('key')
             if not key:
                 continue
+            preview = ''
+            ok2, hist_payload = _openclaw_ws_call(ws, 'chat.history', {'sessionKey': key, 'limit': 10}, deadline)
+            if ok2:
+                # Rückwärts durchgehen — letzte Nachricht mit Text zuerst.
+                for m in reversed((hist_payload or {}).get('messages') or []):
+                    text = _openclaw_extract_text(m)
+                    if text:
+                        preview = text.strip()
+                        break
+            title = preview or s.get('displayName') or s.get('label') or 'Gespräch'
             entries.append({
                 'session_id':    key,
-                'title':         (s.get('displayName') or s.get('label') or 'Gespräch')[:60],
-                'updated_at':    s.get('updatedAt') or s.get('createdAt') or '',
-                # Feldname nicht abschließend verifiziert (Format-Diagnose,
-                # siehe Log falls dauerhaft 0/None) — App zeigt notfalls nur
-                # keine Nachrichtenanzahl an, kein Blocker.
-                'message_count': s.get('messageCount') or 0,
+                'title':         title[:60],
+                'updated_at':    s.get('updatedAt') or s.get('lastInteractionAt') or s.get('createdAt') or '',
+                # Kein echtes Nachrichten-Zähl-Feld in sessions.list gefunden
+                # (Format-Diagnose) — App zeigt bei 0 notfalls einfach keine
+                # Nachrichtenanzahl an, kein Blocker.
+                'message_count': 0,
             })
         return entries
     except Exception as e:
