@@ -3011,8 +3011,9 @@ def _openclaw_gateway_history_detail(server_cfg, session_key):
         ok, payload = _openclaw_ws_call(ws, 'chat.history', {'sessionKey': session_key, 'limit': 200}, deadline)
         if not ok:
             return None
+        raw_messages = (payload or {}).get('messages') or []
         messages = []
-        for m in (payload or {}).get('messages') or []:
+        for m in raw_messages:
             role = m.get('role')
             text = _openclaw_extract_text(m.get('message')) or m.get('deltaText') or ''
             if role and text:
@@ -3021,6 +3022,12 @@ def _openclaw_gateway_history_detail(server_cfg, session_key):
                     'content': text,
                     'timestamp': m.get('timestamp', ''),
                 })
+        if not messages:
+            # Format-Diagnose: chat.history lief ohne Fehler, aber keine
+            # Nachricht ergab role+text — zeigt, wie die Einträge tatsächlich
+            # aussehen (z.B. anderes Feld als 'role'/'message'/'deltaText'),
+            # statt eines stillen "0 Nachrichten".
+            log.warning(f'OpenClaw gateway: chat.history lieferte 0 verwertbare Nachrichten (Format-Diagnose), roh: {raw_messages[:3]}')
         return messages or None
     except Exception as e:
         log.warning(f'OpenClaw gateway: chat.history fehlgeschlagen: {e}')
