@@ -357,12 +357,18 @@ def send_pong(cfg):
     Maschine lautlos fehl, wurde bisher "kein Update" gemeldet, obwohl der
     gemeldete Hash längst veraltet war)."""
     try:
+        ping_body = {
+            'token_b':       cfg['token_b'],
+            'bridge_commit': _git_local_commit()[:7],
+        }
+        # Nur für Openclaw-Profile mitschicken (siehe _openclaw_gateway_status-
+        # Kommentar oben) — für Claude/Hermes/openrouter_local bleibt das Feld
+        # weg, kein unnötiges Rauschen in ac_profiles.
+        if _is_openclaw_binary(_cli_binary(cfg)) and _openclaw_gateway_status is not None:
+            ping_body['openclaw_gateway_status'] = _openclaw_gateway_status
         r = requests.post(
             cfg['server_url'] + '/ping.php',
-            json={
-                'token_b':       cfg['token_b'],
-                'bridge_commit': _git_local_commit()[:7],
-            },
+            json=ping_body,
             timeout=10,
         )
         data = r.json()
@@ -776,6 +782,31 @@ def _openclaw_streaming_ready(cfg):
     return server_cfg
 
 
+# Zwischengespeicherter Gateway-Status, dem Nutzer sichtbar gemacht über
+# send_pong() → ping.php → ac_profiles.openclaw_gateway_status →
+# get_bridge_status → Web-/App-Settings. Aktualisiert sich bei jeder echten
+# Gateway-Nutzung (Chat, Verlauf, Löschen) als Nebeneffekt — bewusst KEIN
+# eigener periodischer Probe-Traffic nur fürs Statusreporting.
+# None      = seit Bridge-Start noch nie versucht (kein Openclaw-Profil aktiv
+#             oder noch keine Anfrage gestellt)
+# 'ok'             = letzter Verbindungsversuch erfolgreich
+# 'needs_pairing'  = Gateway erreichbar, aber Geräte-Freigabe fehlt/entzogen —
+#                     behebt sich von selbst, sobald der Nutzer auf der
+#                     Openclaw-Seite `openclaw devices approve` ausführt (die
+#                     Bridge fragt bei jedem weiteren Versuch automatisch
+#                     erneut nach, kein Bridge-Neustart nötig)
+# 'unreachable'    = Gateway konfiguriert, aber nicht erreichbar (Prozess down,
+#                     Netzwerk, o.ä.)
+# 'not_configured' = kein Gateway-Token in ~/.openclaw/openclaw.json hinterlegt
+#                     (Feature schlicht nicht eingerichtet, kein Fehlerzustand)
+_openclaw_gateway_status = None
+
+
+def _openclaw_set_gateway_status(status):
+    global _openclaw_gateway_status
+    _openclaw_gateway_status = status
+
+
 def _openclaw_gateway_config():
     """Wie _openclaw_config() oben, aber NICHT an
     gateway.http.endpoints.chatCompletions.enabled gekoppelt — das ist nur der
@@ -784,16 +815,19 @@ def _openclaw_gateway_config():
     sobald der Gateway-Prozess selbst läuft. Nur Token + Port werden gebraucht."""
     config_path = Path.home() / '.openclaw' / 'openclaw.json'
     if not config_path.is_file():
+        _openclaw_set_gateway_status('not_configured')
         return None
     try:
         data = json.loads(config_path.read_text())
     except Exception as e:
         log.warning(f'Could not read/parse OpenClaw config at {config_path}: {e}')
+        _openclaw_set_gateway_status('not_configured')
         return None
     gateway = data.get('gateway') or {}
     auth    = gateway.get('auth') or {}
     token   = auth.get('token') or auth.get('password') or ''
     if not token:
+        _openclaw_set_gateway_status('not_configured')
         return None
     return {'host': '127.0.0.1', 'port': gateway.get('port') or 18789, 'token': token}
 
@@ -922,12 +956,14 @@ def _openclaw_ws_handshake(ws, server_cfg, deadline):
             log.warning(f'OpenClaw gateway (WS): Geräte-Signatur fehlgeschlagen, versuche ohne: {e}')
 
     try:
-        return _openclaw_ws_call(ws, 'connect', connect_params, deadline)
+        ok, result = _openclaw_ws_call(ws, 'connect', connect_params, deadline)
     except Exception as e:
-        # Server schließt bei "pairing required" laut Doku die Verbindung
-        # (Code 1008) statt eine reguläre res-Fehlerantwort zu senden —
-        # close_status_code/close_reason mitloggen, falls vorhanden, das
-        # verrät ob die automatische Loopback-Genehmigung nicht griff.
+        # Laut Doku könnte der Server bei "pairing required" auch die
+        # Verbindung schließen (Code 1008) statt einer regulären
+        # res-Fehlerantwort — live beobachtet wurde bisher NUR der reguläre
+        # res-Fehlerfall unten (NOT_PAIRED/PAIRING_REQUIRED), dieser Zweig
+        # bleibt als Fallback für den dokumentierten, aber nicht beobachteten
+        # Fall stehen.
         status  = getattr(ws, 'close_status_code', None) or getattr(ws, 'status_code', None)
         reason  = getattr(ws, 'close_reason', None)
         if status == 1008 or (reason and 'pairing' in str(reason).lower()):
@@ -936,9 +972,29 @@ def _openclaw_ws_handshake(ws, server_cfg, deadline):
                 f'(reason={reason}) — auf dem Gateway-Host prüfen: openclaw devices list / openclaw devices approve, '
                 f'oder gateway.nodes.pairing.autoApproveLocal.'
             )
+            _openclaw_set_gateway_status('needs_pairing')
         else:
             log.warning(f'OpenClaw gateway (WS): connect fehlgeschlagen (status={status}, reason={reason}): {e}')
+            _openclaw_set_gateway_status('unreachable')
         return False, None
+
+    if ok:
+        _openclaw_set_gateway_status('ok')
+        return True, result
+
+    # Regulärer Fehlerfall — live bestätigt 2026-09-04: Pairing-Fehler kommen
+    # als normale res-Antwort mit code NOT_PAIRED/PAIRING_REQUIRED, kein
+    # Verbindungsabbruch (siehe _openclaw_ws_call).
+    error_text = json.dumps(result) if result else ''
+    if 'PAIRING_REQUIRED' in error_text or 'NOT_PAIRED' in error_text:
+        log.warning(
+            f'OpenClaw gateway (WS): Geräte-Freigabe fehlt/wurde entzogen (Format-Diagnose): {result} — '
+            f'auf dem Gateway-Host: openclaw devices list / openclaw devices approve.'
+        )
+        _openclaw_set_gateway_status('needs_pairing')
+    else:
+        _openclaw_set_gateway_status('unreachable')
+    return False, result
 
 
 def _openclaw_ws_ready(cfg):
@@ -2116,7 +2172,11 @@ def _openclaw_ws_call(ws, method, params, deadline):
     übersprungen (chat.send liefert laut Doku nur eine Admission-Bestätigung,
     keine fertige Antwort; echte Inhalte kommen erst über die anschließende
     Event-Schleife in call_agent_openclaw_gateway()). Gibt (ok, payload)
-    zurück — ok=False bei Timeout/Fehler-res."""
+    zurück — ok=False bei Timeout (payload=None) oder Fehler-res (payload=
+    Fehlerobjekt der Antwort, z.B. {'code':'NOT_PAIRED', ...} — live
+    beobachtet 2026-09-04: Pairing-Fehler kommen als GANZ NORMALE
+    res-Fehlerantwort, nicht als Verbindungsabbruch, siehe
+    _openclaw_ws_handshake, die das für den Status auswertet)."""
     req_id = _openclaw_ws_next_id()
     ws.send(json.dumps({'type': 'req', 'id': req_id, 'method': method, 'params': params}))
     while True:
@@ -2125,8 +2185,9 @@ def _openclaw_ws_call(ws, method, params, deadline):
             return False, None
         if frame.get('type') == 'res' and str(frame.get('id')) == req_id:
             if not frame.get('ok', False):
-                log.warning(f'OpenClaw gateway: {method} fehlgeschlagen: {frame.get("error") or frame}')
-                return False, None
+                error = frame.get('error') or frame
+                log.warning(f'OpenClaw gateway: {method} fehlgeschlagen: {error}')
+                return False, error
             return True, frame.get('payload') or {}
         # Frame gehört nicht zu dieser RPC (z.B. ein event) — für später NICHT
         # gepuffert, da vor dem hello-ok/sessions.create-Abschluss keine
