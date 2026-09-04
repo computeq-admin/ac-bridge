@@ -812,7 +812,11 @@ def _openclaw_ws_ready(cfg):
         ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=3)
         ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
             'minProtocol': 4, 'maxProtocol': 4,
-            'client': {'id': 'ac-bridge', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
+            # 'id' ist laut Live-Test KEIN Freitext, sondern ein serverseitig
+            # geprüfter Enum-Wert ('ac-bridge' → 400 INVALID_REQUEST) —
+            # "gateway-client" ist der in der Doku für client.mode:"backend"
+            # genannte Wert, live bestätigt am 2026-09-04.
+            'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
             'role': 'operator',
             'scopes': ['operator.read', 'operator.write'],
             'auth': {'token': server_cfg['token']},
@@ -2026,7 +2030,11 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
         # Gateway-Token genutzt wird (genau unser Fall).
         ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
             'minProtocol': 4, 'maxProtocol': 4,
-            'client': {'id': 'ac-bridge', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
+            # 'id' ist laut Live-Test KEIN Freitext, sondern ein serverseitig
+            # geprüfter Enum-Wert ('ac-bridge' → 400 INVALID_REQUEST) —
+            # "gateway-client" ist der in der Doku für client.mode:"backend"
+            # genannte Wert, live bestätigt am 2026-09-04.
+            'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
             'role': 'operator',
             'scopes': ['operator.read', 'operator.write'],
             'auth': {'token': server_cfg['token']},
