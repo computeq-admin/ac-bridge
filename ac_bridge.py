@@ -997,31 +997,49 @@ def _openclaw_ws_handshake(ws, server_cfg, deadline):
     return False, result
 
 
+_openclaw_gateway_status_reported = None  # letzter per Pong gemeldeter Wert
+
+
+def _openclaw_maybe_report_status_change(cfg):
+    """Löst sofort einen zusätzlichen Pong aus, wenn sich der Gateway-Status
+    seit dem letzten gemeldeten Wert geändert hat — sonst müsste der Nutzer
+    bis zum nächsten regulären, serverseitig getriggerten Pong warten (im
+    echten Test mehrere Minuten), was den Sinn der Statusanzeige untergräbt."""
+    global _openclaw_gateway_status_reported
+    if _openclaw_gateway_status != _openclaw_gateway_status_reported:
+        _openclaw_gateway_status_reported = _openclaw_gateway_status
+        send_pong(cfg)
+
+
 def _openclaw_ws_ready(cfg):
     """Live-Probe fürs native Gateway-Protokoll: kurzer connect+hello-ok-
     Versuch (_openclaw_ws_handshake, dieselbe Logik wie call_agent_openclaw_gateway),
     sofort wieder geschlossen. Gibt server_cfg zurück wenn nutzbar, sonst None
-    (Aufrufer fällt dann auf den CLI-Pfad zurück)."""
+    (Aufrufer fällt dann auf den CLI-Pfad zurück). Einziger gemeinsamer
+    Rückgabepunkt (result-Variable statt mehrerer return-Stellen), damit
+    _openclaw_maybe_report_status_change() garantiert auf jedem Pfad läuft."""
+    result = None
     server_cfg = _openclaw_gateway_config()
-    if server_cfg is None:
-        return None
-    ws = None
-    try:
-        ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=3)
-        ok, hello_payload = _openclaw_ws_handshake(ws, server_cfg, time.monotonic() + 5)
-        if not ok or (hello_payload or {}).get('type') != 'hello-ok':
-            log.info('OpenClaw gateway (WS) connect/hello-ok fehlgeschlagen — falling back to CLI.')
-            return None
-    except Exception as e:
-        log.info(f'OpenClaw gateway (WS) not reachable ({e}) — falling back to CLI.')
-        return None
-    finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-    return server_cfg
+    if server_cfg is not None:
+        ws = None
+        try:
+            ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=3)
+            ok, hello_payload = _openclaw_ws_handshake(ws, server_cfg, time.monotonic() + 5)
+            if not ok or (hello_payload or {}).get('type') != 'hello-ok':
+                log.info('OpenClaw gateway (WS) connect/hello-ok fehlgeschlagen — falling back to CLI.')
+            else:
+                result = server_cfg
+        except Exception as e:
+            log.info(f'OpenClaw gateway (WS) not reachable ({e}) — falling back to CLI.')
+            _openclaw_set_gateway_status('unreachable')
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+    _openclaw_maybe_report_status_change(cfg)
+    return result
 
 
 _HERMES_REASONING_HEADER_RE = re.compile(r'^\s*┌─\s*Reasoning\b[^\n]*┐\s*\n+')
