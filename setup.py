@@ -531,6 +531,24 @@ def main():
             sys.exit(1)
         cmd_redeem_ott(sys.argv[idx + 1].strip())
 
+    # ── Nur die systemd-Unit-Datei neu schreiben (z.B. nach einem Update, das
+    # ac_bridge.service geändert hat — --config oben deckt das NICHT ab, das
+    # betrifft nur config.json/den Agenten, install_service() wird dort nie
+    # aufgerufen). Explizites restart statt nur install_service()s eigenem
+    # "enable --now", da das bei einem bereits laufenden Service NICHT die neu
+    # geschriebene Unit-Datei lädt (--now startet nur, falls noch nicht aktiv).
+    if '--reinstall-service' in sys.argv:
+        cfg = load_or_create_config()
+        service_name = cfg.get('service_name', 'ac_bridge')
+        install_service(Path(__file__).parent, service_name)
+        try:
+            subprocess.run(['systemctl', '--user', 'restart', service_name], check=True)
+            print(f"  ✓ Service '{service_name}' neu gestartet (neue Unit-Datei aktiv)")
+        except Exception as e:
+            print(f"  ⚠ Neustart fehlgeschlagen: {e}")
+            print(f"  Manuell: systemctl --user restart {service_name}")
+        sys.exit(0)
+
     # ── Nur Agent-Konfiguration (ohne Neuverbindung) ──────────────────────────
     if '--config' in sys.argv:
         cfg = load_or_create_config()

@@ -15,6 +15,8 @@ if [ "$1" == "--setup" ]; then
     exec "$VENV" "$DIR/setup.py"
 elif [ "$1" == "--config" ]; then
     exec "$VENV" "$DIR/setup.py" --config
+elif [ "$1" == "--reinstall-service" ]; then
+    exec "$VENV" "$DIR/setup.py" --reinstall-service
 else
-    exec "$VENV" "$DIR/aat_bridge.py"
+    exec "$VENV" "$DIR/ac_bridge.py"
 fi
