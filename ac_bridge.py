@@ -2171,14 +2171,19 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
 
         # 3) Nachricht abschicken — chat.send bestätigt laut Doku nur die
         # Annahme (status:"started"), die eigentliche Antwort kommt über
-        # nachfolgende event-Frames (Schritt 4).
-        messages = []
+        # nachfolgende event-Frames (Schritt 4). params ist EIN 'message'-
+        # Textfeld, KEIN 'messages'-Array (live bestätigt 2026-09-04:
+        # "must have required property 'message'; unexpected property
+        # 'messages'") — kein separates System-Rollen-Feld erkennbar, daher
+        # derselbe Voranstellen-Trick wie beim CLI-Fallback
+        # (_frame_one_time_system_prompt, einmalig gültig eingerahmt).
+        message_text = prompt
         if system_prompt:
-            messages.append({'role': 'system', 'text': system_prompt})
-        messages.append({'role': 'user', 'text': prompt})
+            framed = _frame_one_time_system_prompt(system_prompt, cfg.get('lang', 'DE'))
+            message_text = f'{framed}\n\n{prompt}' if prompt else framed
         ok, _send_payload = _openclaw_ws_call(ws, 'chat.send', {
             'sessionKey': session_key,
-            'messages': messages,
+            'message': message_text,
         }, deadline)
         if not ok:
             return None, None
