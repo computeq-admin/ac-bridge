@@ -2181,9 +2181,14 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
         if system_prompt:
             framed = _frame_one_time_system_prompt(system_prompt, cfg.get('lang', 'DE'))
             message_text = f'{framed}\n\n{prompt}' if prompt else framed
+        import uuid as _uuid
         ok, _send_payload = _openclaw_ws_call(ws, 'chat.send', {
             'sessionKey': session_key,
             'message': message_text,
+            # Pflichtfeld laut Server (live bestätigt 2026-09-04: "must have
+            # required property 'idempotencyKey'") — dient laut Doku der
+            # Deduplizierung wiederholter Requests, pro Sendevorgang neu.
+            'idempotencyKey': str(_uuid.uuid4()),
         }, deadline)
         if not ok:
             return None, None
