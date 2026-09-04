@@ -856,6 +856,24 @@ def _openclaw_sign_device_payload(private_key, device_id, signed_at_ms, token, n
     return _base64.urlsafe_b64encode(signature).rstrip(b'=').decode('ascii')
 
 
+def _openclaw_extract_text(message):
+    """Extrahiert reinen Text aus einem OpenClaw-'message'-Objekt eines
+    chat-Events — live bestätigt 2026-09-04:
+    {'role': 'assistant', 'content': [{'type': 'text', 'text': '...'}], 'timestamp': ...}
+    'content' ist eine Liste von Blöcken (nicht nur Text-Blöcke denkbar,
+    andere Typen werden ignoriert statt einen Fehler auszulösen)."""
+    if not isinstance(message, dict):
+        return None
+    content = message.get('content')
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
+        joined = ''.join(parts)
+        return joined or None
+    return message.get('text') or None
+
+
 def _openclaw_ws_handshake(ws, server_cfg, deadline):
     """Gemeinsamer connect-Handshake für _openclaw_ws_ready() (Live-Probe) und
     call_agent_openclaw_gateway() (echter Aufruf). Wartet zuerst auf das vom
@@ -2193,34 +2211,44 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
         if not ok:
             return None, None
 
-        # 4) Event-Schleife bis session.message mit state=="done"/"error".
+        # 4) Event-Schleife bis 'chat'-Event mit state=="final"/"error" — live
+        # bestätigt 2026-09-04 (ursprüngliche Annahme "session.message"/"done"
+        # war falsch, siehe Format-Diagnose-Log unten). Bricht bewusst beim
+        # ERSTEN "final" ab: ein Modell-Fallback (z.B. abgelaufenes Anthropic-
+        # OAuth → Umschalten auf einen anderen Provider) erzeugt einen ZWEITEN,
+        # eigenständigen "final"-Chat mit einer Fallback-Hinweis-Nachricht statt
+        # der echten Antwort — die kommt zuverlässig zuerst.
         accumulated  = ''
         final_text   = None
         last_post    = 0.0
         last_posted  = None
-        announced_tools = set()
         while True:
             frame = _openclaw_ws_recv_json(ws, deadline)
             if frame is None:
                 log.warning(f'OpenClaw gateway: Timeout/Verbindungsende während der Antwort (Session {session_key}).')
                 return None, None
-            # Jeden Frame vor der type/event-Weiche loggen (Format-Diagnose) —
-            # falls kein session.message/state=="done" je ankommt, zeigt das
-            # HIER, was stattdessen tatsächlich reinkommt (anderer Event-Name,
-            # anderes Feld, res statt event, o.ä.), statt eines stillen Hängers.
-            log.info(f'OpenClaw gateway: Frame empfangen (Format-Diagnose): {frame}')
             if frame.get('type') != 'event':
                 continue
             event   = frame.get('event')
             payload = frame.get('payload') or {}
+            # Der Gateway schickt pro Antwort viele Frames, die uns nicht
+            # interessieren (health/tick/presence, agent-Zwischenstände wie
+            # 'thinking'/'run_status') — bewusst NICHT einzeln geloggt, sonst
+            # flutet jede einzelne Anfrage das Bridge-Log. Nur 'chat'-Events
+            # werten wir unten aus, alles andere wird stillschweigend übersprungen.
 
-            if event == 'chat':
+            if event != 'chat':
+                continue
+            state = payload.get('state')
+
+            if state == 'delta':
                 delta = payload.get('deltaText') or ''
-                # 'message' ist laut Doku der kumulierte Snapshot bis hierhin —
-                # robuster als eigenes Aneinanderhängen der deltaText-Stücke
-                # (kein Drift-Risiko), wird bevorzugt falls vorhanden.
-                snapshot = payload.get('message')
-                if isinstance(snapshot, str) and snapshot:
+                # 'message' ist der kumulierte Snapshot bis hierhin (Objekt,
+                # NICHT String — content ist eine Liste von {type, text}-
+                # Blöcken) — robuster als eigenes Aneinanderhängen der
+                # deltaText-Stücke, wird bevorzugt falls vorhanden.
+                snapshot = _openclaw_extract_text(payload.get('message'))
+                if snapshot:
                     accumulated = snapshot
                 elif delta:
                     accumulated += delta
@@ -2231,42 +2259,17 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
                         last_post   = now
                         last_posted = accumulated
 
-            elif event in ('session.tool', 'session.operation'):
-                # Format nicht abschließend verifiziert — best effort, bricht
-                # bei unerwarteter Form NICHT die ganze Antwort ab.
-                try:
-                    name = payload.get('name') or payload.get('tool') or (payload.get('operation') or {}).get('name')
-                    if name and name not in announced_tools:
-                        announced_tools.add(name)
-                        if on_partial:
-                            status_line = f'🔧 {name} …'
-                            on_partial(status_line)
-                            last_posted = status_line
-                except Exception:
-                    log.info(f'OpenClaw gateway: {event}-Payload unerwartet (Format-Diagnose): {payload}')
+            elif state == 'final':
+                final_text = _openclaw_extract_text(payload.get('message'))
+                break
 
-            elif event == 'session.message':
-                state = payload.get('state')
-                if state == 'done':
-                    msg = payload.get('message')
-                    if isinstance(msg, dict):
-                        final_text = msg.get('text') or msg.get('content')
-                    elif isinstance(msg, str):
-                        final_text = msg
-                    break
-                if state == 'error':
-                    log.warning(f'OpenClaw gateway: session.message state=error (Format-Diagnose): {payload}')
-                    return None, None
-
-            elif event == 'sessions.changed':
-                # Nur als zusätzliches Diagnose-Signal geloggt (activeRunIds) —
-                # session.message state=="done" oben bleibt das primäre,
-                # dokumentierte Abschlusskriterium.
-                log.info(f'OpenClaw gateway: sessions.changed (Format-Diagnose): {payload}')
+            elif state == 'error':
+                log.warning(f'OpenClaw gateway: chat state=error (Format-Diagnose): {payload}')
+                return None, None
 
         answer = final_text or accumulated
         if not answer:
-            log.warning('OpenClaw gateway: session.message state=done ohne verwertbaren Text — falling back to CLI.')
+            log.warning('OpenClaw gateway: chat state=final ohne verwertbaren Text — falling back to CLI.')
             return None, None
 
         store_session_id(session_key)
