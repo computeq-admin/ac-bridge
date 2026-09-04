@@ -3042,6 +3042,26 @@ def _read_openclaw_detail(path):
 # wird derselbe Gateway-Kanal genutzt wie fürs Senden — sessions.list/chat.history,
 # analog zu sessions.create/chat.send in call_agent_openclaw_gateway().
 
+def _openclaw_gateway_ts_to_iso(value):
+    """sessions.list liefert updatedAt/lastInteractionAt/createdAt als
+    Millisekunden-Epoch-ZAHL (live bestätigt 2026-09-04), nicht als String wie
+    bei den anderen Backends (_iso_from_mtime, _hermes_sid_to_iso). Ungefixt
+    brach das den Web-UI-Verlauf komplett: formatDate() dort ruft s.replace()
+    auf den Wert auf, was bei einer Zahl eine TypeError wirft und den gesamten
+    Render-Loop abbricht — sichtbar als 'Lädt…' verschwindet, aber keine
+    Zeile erscheint. Deshalb hier auf dasselbe ISO-String-Format normalisieren,
+    das alle anderen Backends liefern."""
+    if value is None or value == '':
+        return ''
+    if isinstance(value, str):
+        return value
+    try:
+        import datetime
+        return datetime.datetime.utcfromtimestamp(float(value) / 1000).isoformat() + 'Z'
+    except (TypeError, ValueError, OSError):
+        return ''
+
+
 def _openclaw_gateway_history_list(server_cfg):
     """sessions.list liefert KEIN Titel-/Vorschau-Feld (live bestätigt
     2026-09-04 — nur Metadaten wie Token-Zahlen, Modell, Timestamps, kein
@@ -3082,7 +3102,9 @@ def _openclaw_gateway_history_list(server_cfg):
             entries.append({
                 'session_id':    key,
                 'title':         title[:60],
-                'updated_at':    s.get('updatedAt') or s.get('lastInteractionAt') or s.get('createdAt') or '',
+                'updated_at':    _openclaw_gateway_ts_to_iso(
+                    s.get('updatedAt') or s.get('lastInteractionAt') or s.get('createdAt')
+                ),
                 # Kein echtes Nachrichten-Zähl-Feld in sessions.list gefunden
                 # (Format-Diagnose) — App zeigt bei 0 notfalls einfach keine
                 # Nachrichtenanzahl an, kein Blocker.
@@ -3126,7 +3148,7 @@ def _openclaw_gateway_history_detail(server_cfg, session_key):
                 messages.append({
                     'role': 'agent' if role == 'assistant' else role,
                     'content': text,
-                    'timestamp': m.get('timestamp', ''),
+                    'timestamp': _openclaw_gateway_ts_to_iso(m.get('timestamp')),
                 })
         if not messages:
             # Format-Diagnose: chat.history lief ohne Fehler, aber keine
