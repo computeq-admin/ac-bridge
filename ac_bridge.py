@@ -3014,8 +3014,14 @@ def _openclaw_gateway_history_detail(server_cfg, session_key):
         raw_messages = (payload or {}).get('messages') or []
         messages = []
         for m in raw_messages:
+            # Live bestätigt 2026-09-04: role+content stehen direkt auf dem
+            # Eintrag selbst (NICHT unter einem verschachtelten 'message'-Feld
+            # wie beim chat-Event während des Streamens) — content ist bei
+            # 'assistant' eine Blockliste ({'type':'text','text':...}), bei
+            # 'user' oft direkt ein String; _openclaw_extract_text() deckt
+            # beides ab.
             role = m.get('role')
-            text = _openclaw_extract_text(m.get('message')) or m.get('deltaText') or ''
+            text = _openclaw_extract_text(m) or ''
             if role and text:
                 messages.append({
                     'role': 'agent' if role == 'assistant' else role,
