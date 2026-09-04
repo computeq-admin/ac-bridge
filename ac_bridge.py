@@ -3455,10 +3455,12 @@ def _openclaw_gateway_delete_session(server_cfg, session_key):
     Archiv-Filter in _openclaw_gateway_history_list). Rückgabe (deleted,
     errors), gleiche Form wie _hermes_delete_session().
 
-    archived:true braucht laut Doku den aktuellen sessionId als
-    expectedSessionId (Race-Schutz) — vorher per sessions.describe geholt;
-    schlägt das fehl, wird trotzdem ohne expectedSessionId versucht (evtl.
-    optional, Format-Diagnose falls nicht)."""
+    archived:true braucht laut Doku UND live bestätigt (2026-09-04,
+    "expectedSessionId required for session lifecycle patch") den aktuellen
+    sessionId als expectedSessionId (Race-Schutz). sessions.describe lieferte
+    dafür nichts Brauchbares — stattdessen sessions.list (bereits bestätigt
+    funktionierend) nach dem passenden key filtern, dort steht sessionId pro
+    Zeile mit drin."""
     ws = None
     try:
         ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
@@ -3466,13 +3468,16 @@ def _openclaw_gateway_delete_session(server_cfg, session_key):
         ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
         if not ok:
             return [], [f'OpenClaw gateway: Handshake für sessions.patch fehlgeschlagen (session={session_key})']
-        ok, describe = _openclaw_ws_call(ws, 'sessions.describe', {'key': session_key}, deadline)
-        expected_session_id = (describe or {}).get('sessionId') if ok else None
-        if not ok:
-            log.info(f'OpenClaw gateway: sessions.describe fehlgeschlagen (Format-Diagnose), versuche Archivieren ohne expectedSessionId: {describe}')
-        params = {'key': session_key, 'archived': True}
-        if expected_session_id:
-            params['expectedSessionId'] = expected_session_id
+        ok, list_payload = _openclaw_ws_call(ws, 'sessions.list', {'limit': 50}, deadline)
+        expected_session_id = None
+        if ok:
+            for row in (list_payload or {}).get('sessions') or []:
+                if row.get('key') == session_key:
+                    expected_session_id = row.get('sessionId')
+                    break
+        if not expected_session_id:
+            return [], [f'OpenClaw gateway: sessionId für {session_key} nicht in sessions.list gefunden — Archivieren übersprungen']
+        params = {'key': session_key, 'archived': True, 'expectedSessionId': expected_session_id}
         ok, resp = _openclaw_ws_call(ws, 'sessions.patch', params, deadline)
         if not ok:
             return [], [f'OpenClaw gateway: sessions.patch (archive) fehlgeschlagen (session={session_key}): {resp}']
