@@ -2974,8 +2974,14 @@ def _openclaw_gateway_history_list(server_cfg):
         ok, payload = _openclaw_ws_call(ws, 'sessions.list', {'limit': 50}, deadline)
         if not ok:
             return []
+        # Format-Diagnose: zeigt, ob sessions.list schon ein Vorschau-/Titel-
+        # Feld mitliefert (letzte Nachricht o.ä.), bevor wir dafür extra
+        # chat.history-Aufrufe pro Session einbauen.
+        raw_sessions = (payload or {}).get('sessions') or []
+        if raw_sessions:
+            log.info(f'OpenClaw gateway: sessions.list Rohdaten (Format-Diagnose): {raw_sessions[:2]}')
         entries = []
-        for s in (payload or {}).get('sessions') or []:
+        for s in raw_sessions:
             key = s.get('key')
             if not key:
                 continue
