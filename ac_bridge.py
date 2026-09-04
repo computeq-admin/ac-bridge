@@ -11,7 +11,7 @@ Ablauf:
   5. Schreibt Antwort zurück an Server (Token-B rotiert)
 
 Installation:
-  pip install paho-mqtt requests
+  pip install -r requirements.txt
 
 Konfiguration: config.json im gleichen Verzeichnis
 """
@@ -33,6 +33,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import requests
+import websocket  # websocket-client — synchron, siehe call_agent_openclaw_gateway()
 
 # ─────────────────────────────────────────────
 # Logging
@@ -772,6 +773,62 @@ def _openclaw_streaming_ready(cfg):
     except Exception as e:
         log.info(f'OpenClaw gateway not reachable ({e}) — falling back to CLI.')
         return None
+    return server_cfg
+
+
+def _openclaw_gateway_config():
+    """Wie _openclaw_config() oben, aber NICHT an
+    gateway.http.endpoints.chatCompletions.enabled gekoppelt — das ist nur der
+    OpenAI-Kompat-HTTP-Layer (siehe call_agent_openclaw_streaming), das native
+    WebSocket-Protokoll (call_agent_openclaw_gateway) läuft unabhängig davon,
+    sobald der Gateway-Prozess selbst läuft. Nur Token + Port werden gebraucht."""
+    config_path = Path.home() / '.openclaw' / 'openclaw.json'
+    if not config_path.is_file():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception as e:
+        log.warning(f'Could not read/parse OpenClaw config at {config_path}: {e}')
+        return None
+    gateway = data.get('gateway') or {}
+    auth    = gateway.get('auth') or {}
+    token   = auth.get('token') or auth.get('password') or ''
+    if not token:
+        return None
+    return {'host': '127.0.0.1', 'port': gateway.get('port') or 18789, 'token': token}
+
+
+def _openclaw_ws_ready(cfg):
+    """Live-Probe fürs native Gateway-Protokoll: kurzer connect+hello-ok-
+    Versuch (dieselbe Handshake-Logik wie call_agent_openclaw_gateway, per
+    _openclaw_ws_call unten wiederverwendet), sofort wieder geschlossen. Gibt
+    server_cfg zurück wenn nutzbar, sonst None (Aufrufer fällt dann auf den
+    CLI-Pfad zurück)."""
+    server_cfg = _openclaw_gateway_config()
+    if server_cfg is None:
+        return None
+    ws = None
+    try:
+        ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=3)
+        ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
+            'minProtocol': 4, 'maxProtocol': 4,
+            'client': {'id': 'ac-bridge', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
+            'role': 'operator',
+            'scopes': ['operator.read', 'operator.write'],
+            'auth': {'token': server_cfg['token']},
+        }, time.monotonic() + 3)
+        if not ok or (hello_payload or {}).get('type') != 'hello-ok':
+            log.info('OpenClaw gateway (WS) connect/hello-ok fehlgeschlagen — falling back to CLI.')
+            return None
+    except Exception as e:
+        log.info(f'OpenClaw gateway (WS) not reachable ({e}) — falling back to CLI.')
+        return None
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
     return server_cfg
 
 
@@ -1869,6 +1926,240 @@ def call_agent_openclaw_streaming(cfg, server_cfg, prompt, system_prompt='', fil
     return accumulated, resume_id
 
 
+# ─────────────────────────────────────────────
+# OpenClaw natives Gateway-Protokoll (WebSocket, docs.openclaw.ai/gateway/protocol,
+# 2026-09 recherchiert) — Nachfolger von call_agent_openclaw_streaming() oben (dem
+# reinen OpenAI-Kompatibilitäts-Shim mit selbst generiertem Session-Header ohne
+# echtes Server-Session-Objekt). Hier: echte, vom Gateway verwaltete Sessions
+# (sessions.create liefert einen strukturierten sessionKey) + granulare
+# Event-Typen für Tool-Nutzung während des Streamens (session.tool/
+# session.operation), statt des generischen OpenAI-delta.tool_calls-Formats.
+#
+# NICHT live verifiziert (kein laufendes Gateway in der Entwicklungsumgebung
+# verfügbar) — nur aus der offiziellen Doku abgeleitet. Bewusst so defensiv wie
+# call_agent_openclaw_streaming() oben gebaut: jeder unerwartete Frame wird
+# geloggt statt zum Absturz zu führen, jeder Fehler fällt auf den bewährten
+# CLI-Pfad zurück (siehe process_wakeup()) — beim ersten echten Testlauf sollten
+# die Format-Diagnose-Logs unten zeigen, ob Annahmen (Feldnamen, Abschluss-Event)
+# stimmen.
+# ─────────────────────────────────────────────
+
+_openclaw_ws_req_counter = 0
+
+
+def _openclaw_ws_next_id():
+    global _openclaw_ws_req_counter
+    _openclaw_ws_req_counter += 1
+    return str(_openclaw_ws_req_counter)
+
+
+def _openclaw_ws_recv_json(ws, deadline):
+    """Liest EIN Frame, bis zum übergebenen monotonic()-Deadline. Gibt das
+    geparste Dict zurück, oder None bei Timeout/Verbindungsende/Parse-Fehler
+    (Aufrufer behandelt das wie 'keine weiteren Frames mehr')."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    ws.settimeout(remaining)
+    try:
+        raw = ws.recv()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        log.info(f'OpenClaw gateway: Frame kein gültiges JSON (Format-Diagnose): {str(raw)[:300]}')
+        return None
+
+
+def _openclaw_ws_call(ws, method, params, deadline):
+    """Sendet eine req/res-RPC (connect, sessions.create, chat.send) und wartet
+    auf die passende res — event-Frames, die währenddessen eintreffen, werden
+    übersprungen (chat.send liefert laut Doku nur eine Admission-Bestätigung,
+    keine fertige Antwort; echte Inhalte kommen erst über die anschließende
+    Event-Schleife in call_agent_openclaw_gateway()). Gibt (ok, payload)
+    zurück — ok=False bei Timeout/Fehler-res."""
+    req_id = _openclaw_ws_next_id()
+    ws.send(json.dumps({'type': 'req', 'id': req_id, 'method': method, 'params': params}))
+    while True:
+        frame = _openclaw_ws_recv_json(ws, deadline)
+        if frame is None:
+            return False, None
+        if frame.get('type') == 'res' and str(frame.get('id')) == req_id:
+            if not frame.get('ok', False):
+                log.warning(f'OpenClaw gateway: {method} fehlgeschlagen: {frame.get("error") or frame}')
+                return False, None
+            return True, frame.get('payload') or {}
+        # Frame gehört nicht zu dieser RPC (z.B. ein event) — für später NICHT
+        # gepuffert, da vor dem hello-ok/sessions.create-Abschluss keine
+        # relevanten events zu erwarten sind (nur bei chat.send selbst, das
+        # diese Funktion NICHT für den Empfang der eigentlichen Antwort nutzt).
+
+
+def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files=None,
+                                 session_id_override=None, on_partial=None):
+    """Wie call_agent_openclaw_streaming() (gleiche Signatur/Rückgabe:
+    (answer, session_key), answer=None bei Fehler → Aufrufer fällt auf CLI
+    zurück), aber über das native WebSocket-Gateway-Protokoll statt des
+    OpenAI-Kompatibilitäts-Shims — echte, vom Server verwaltete Sessions.
+
+    session_id_override: hier ein zuvor von sessions.create erhaltener
+    sessionKey (String wie "agent:<id>:main"), NICHT wie beim HTTP-Shim ein
+    selbst generierter UUID — bei Übergabe wird direkt chat.send auf diese
+    Session geschickt, sonst zuerst sessions.create."""
+    ws_url = f"ws://{server_cfg['host']}:{server_cfg['port']}"
+    timeout = cfg.get('cli_timeout', 600)
+    deadline = time.monotonic() + timeout
+
+    file_note = _file_note_prefix(files)
+    if file_note:
+        prompt = f'{file_note}\n\n{prompt}' if prompt else file_note
+
+    ws = None
+    try:
+        ws = websocket.create_connection(ws_url, timeout=10)
+
+        # 1) Handshake — client.mode "backend" auf Loopback darf laut Doku das
+        # device-Feld (Public-Key-Pairing) weglassen, wenn der gemeinsame
+        # Gateway-Token genutzt wird (genau unser Fall).
+        ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
+            'minProtocol': 4, 'maxProtocol': 4,
+            'client': {'id': 'ac-bridge', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
+            'role': 'operator',
+            'scopes': ['operator.read', 'operator.write'],
+            'auth': {'token': server_cfg['token']},
+        }, deadline)
+        if not ok or (hello_payload or {}).get('type') != 'hello-ok':
+            log.warning(f'OpenClaw gateway: connect/hello-ok fehlgeschlagen (Format-Diagnose): {hello_payload}')
+            return None, None
+
+        # 2) Session bestimmen — Fortsetzen, wenn ein Key übergeben wurde (App-
+        # gesteuert) ODER die Bridge selbst noch eine offene Session im
+        # Speicher hat (gleiches Vorrang-Muster wie bei Claude/Hermes,
+        # _build_agent_command: session_id_override or _current_session_id),
+        # sonst neu anlegen (agentId-Discovery wiederverwendet dieselbe
+        # Auto-Discovery wie der CLI-Pfad, siehe discover_openclaw_agent_id).
+        session_key = session_id_override or _current_session_id
+        if not session_key:
+            cli_binary = _cli_binary(cfg)
+            _cwd = os.path.expanduser(cfg.get('cli_working_dir') or '') or None
+            agent_id = discover_openclaw_agent_id(cli_binary, _cwd) if cli_binary else None
+            ok, create_payload = _openclaw_ws_call(ws, 'sessions.create', {
+                'agentId': agent_id,
+            } if agent_id else {}, deadline)
+            if not ok:
+                return None, None
+            session_key = (create_payload or {}).get('sessionKey') or (create_payload or {}).get('key')
+            if not session_key:
+                log.warning(f'OpenClaw gateway: sessions.create ohne sessionKey (Format-Diagnose): {create_payload}')
+                return None, None
+            log.info(f'OpenClaw gateway: neue Session angelegt: {session_key}')
+
+        # 3) Nachricht abschicken — chat.send bestätigt laut Doku nur die
+        # Annahme (status:"started"), die eigentliche Antwort kommt über
+        # nachfolgende event-Frames (Schritt 4).
+        messages = []
+        if system_prompt:
+            messages.append({'role': 'system', 'text': system_prompt})
+        messages.append({'role': 'user', 'text': prompt})
+        ok, _send_payload = _openclaw_ws_call(ws, 'chat.send', {
+            'sessionKey': session_key,
+            'messages': messages,
+        }, deadline)
+        if not ok:
+            return None, None
+
+        # 4) Event-Schleife bis session.message mit state=="done"/"error".
+        accumulated  = ''
+        final_text   = None
+        last_post    = 0.0
+        last_posted  = None
+        announced_tools = set()
+        while True:
+            frame = _openclaw_ws_recv_json(ws, deadline)
+            if frame is None:
+                log.warning(f'OpenClaw gateway: Timeout/Verbindungsende während der Antwort (Session {session_key}).')
+                return None, None
+            if frame.get('type') != 'event':
+                continue
+            event   = frame.get('event')
+            payload = frame.get('payload') or {}
+
+            if event == 'chat':
+                delta = payload.get('deltaText') or ''
+                # 'message' ist laut Doku der kumulierte Snapshot bis hierhin —
+                # robuster als eigenes Aneinanderhängen der deltaText-Stücke
+                # (kein Drift-Risiko), wird bevorzugt falls vorhanden.
+                snapshot = payload.get('message')
+                if isinstance(snapshot, str) and snapshot:
+                    accumulated = snapshot
+                elif delta:
+                    accumulated += delta
+                if (delta or snapshot) and on_partial:
+                    now = time.monotonic()
+                    if (now - last_post) >= 1.5:
+                        on_partial(accumulated)
+                        last_post   = now
+                        last_posted = accumulated
+
+            elif event in ('session.tool', 'session.operation'):
+                # Format nicht abschließend verifiziert — best effort, bricht
+                # bei unerwarteter Form NICHT die ganze Antwort ab.
+                try:
+                    name = payload.get('name') or payload.get('tool') or (payload.get('operation') or {}).get('name')
+                    if name and name not in announced_tools:
+                        announced_tools.add(name)
+                        if on_partial:
+                            status_line = f'🔧 {name} …'
+                            on_partial(status_line)
+                            last_posted = status_line
+                except Exception:
+                    log.info(f'OpenClaw gateway: {event}-Payload unerwartet (Format-Diagnose): {payload}')
+
+            elif event == 'session.message':
+                state = payload.get('state')
+                if state == 'done':
+                    msg = payload.get('message')
+                    if isinstance(msg, dict):
+                        final_text = msg.get('text') or msg.get('content')
+                    elif isinstance(msg, str):
+                        final_text = msg
+                    break
+                if state == 'error':
+                    log.warning(f'OpenClaw gateway: session.message state=error (Format-Diagnose): {payload}')
+                    return None, None
+
+            elif event == 'sessions.changed':
+                # Nur als zusätzliches Diagnose-Signal geloggt (activeRunIds) —
+                # session.message state=="done" oben bleibt das primäre,
+                # dokumentierte Abschlusskriterium.
+                log.info(f'OpenClaw gateway: sessions.changed (Format-Diagnose): {payload}')
+
+        answer = final_text or accumulated
+        if not answer:
+            log.warning('OpenClaw gateway: session.message state=done ohne verwertbaren Text — falling back to CLI.')
+            return None, None
+
+        store_session_id(session_key)
+        if on_partial and answer != last_posted:
+            on_partial(answer)
+
+        log.info(f'OpenClaw gateway (native) answered ({len(answer)} chars, session {session_key})')
+        return answer, session_key
+
+    except Exception as e:
+        log.warning(f'OpenClaw gateway (native) failed (falling back to CLI): {e}')
+        return None, None
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def _safe_attachment_name(name, job_id, index=0):
     """Bereinigt den Dateinamen bridge-seitig auf einen sicheren Basisnamen (keine
     Pfad-Anteile → keine Traversal), behält die Endung. Job-ID + Zeitstempel voran,
@@ -2055,7 +2346,13 @@ def process_wakeup(cfg):
     hermes_api_cfg   = (_hermes_api_server_ready(cfg)
                         if (wants_stream_requested and is_hermes_cli)
                         else None)
-    openclaw_api_cfg = _openclaw_streaming_ready(cfg) if (wants_stream_requested and is_openclaw_cli) else None
+    # OpenClaw-Gateway UNABHÄNGIG von wants_stream prüfen (anders als Hermes
+    # oben) — das Gateway ist für OpenClaw der einzige Weg zu zuverlässigen
+    # Sessions (der CLI-Fallback kennt keine funktionierende Session-
+    # Fortsetzung), nicht nur ein Streaming-Komfort. Ist es erreichbar, soll
+    # es IMMER genutzt werden, auch wenn der Nutzer kein Streaming angefragt
+    # hat (siehe unten, eigener Zweig ohne on_partial).
+    openclaw_api_cfg = _openclaw_ws_ready(cfg) if is_openclaw_cli else None
     wants_stream     = wants_stream_requested and (
         is_claude_cli or hermes_api_cfg is not None or openclaw_api_cfg is not None
     )
@@ -2125,14 +2422,30 @@ def process_wakeup(cfg):
                 reasoning=hermes_reasoning,
             )
         else:
-            log.info(f'Job #{job_id}: streaming enabled (OpenClaw gateway)')
-            answer, new_session_id = call_agent_openclaw_streaming(
+            log.info(f'Job #{job_id}: streaming enabled (OpenClaw gateway, native)')
+            answer, new_session_id = call_agent_openclaw_gateway(
                 cfg, openclaw_api_cfg, prompt, system_prompt, files=downloaded_files or None,
                 session_id_override=job_session_id,
                 on_partial=lambda text: put_partial(cfg, job_id, text),
             )
         if answer is None:
             log.warning(f'Job #{job_id}: streaming failed — falling back to non-streaming run.')
+            answer, new_session_id = call_agent_cli(
+                cfg, prompt, system_prompt, files=downloaded_files or None,
+                session_id_override=job_session_id, hermes_reasoning=hermes_reasoning,
+            )
+    elif openclaw_api_cfg is not None:
+        # Kein Streaming angefragt, aber OpenClaw-Gateway erreichbar — trotzdem
+        # darüber laufen lassen statt CLI (siehe Kommentar oben bei
+        # openclaw_api_cfg): gleiche Funktion wie im Streaming-Zweig, nur ohne
+        # on_partial (akkumuliert still, kein put_partial-Zwischenaufruf).
+        log.info(f'Job #{job_id}: OpenClaw gateway (native, ohne Streaming-Anfrage, für Session-Kontinuität genutzt)')
+        answer, new_session_id = call_agent_openclaw_gateway(
+            cfg, openclaw_api_cfg, prompt, system_prompt, files=downloaded_files or None,
+            session_id_override=job_session_id,
+        )
+        if answer is None:
+            log.warning(f'Job #{job_id}: OpenClaw gateway failed — falling back to CLI.')
             answer, new_session_id = call_agent_cli(
                 cfg, prompt, system_prompt, files=downloaded_files or None,
                 session_id_override=job_session_id, hermes_reasoning=hermes_reasoning,

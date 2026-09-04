@@ -5,6 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=__INSTALL_DIR__
+ExecStartPre=-__INSTALL_DIR__/venv/bin/pip install -q -r __INSTALL_DIR__/requirements.txt
 ExecStart=__INSTALL_DIR__/venv/bin/python3 __INSTALL_DIR__/ac_bridge.py
 Restart=always
 RestartSec=30
