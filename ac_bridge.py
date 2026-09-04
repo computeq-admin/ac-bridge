@@ -3441,6 +3441,33 @@ def build_history_delete_paths(cfg, session_id):
     return []
 
 
+def _openclaw_gateway_delete_session(server_cfg, session_key):
+    """Löscht eine Session permanent über sessions.delete (native Gateway-
+    RPC, docs.openclaw.ai/gateway/protocol — Gegenstück zu sessions.archive
+    für ein reines Soft-Hide, hier bewusst die permanente Variante, da die
+    App den Eintrag ohnehin schon als "gelöscht" behandelt). Rückgabe
+    (deleted, errors), gleiche Form wie _hermes_delete_session()."""
+    ws = None
+    try:
+        ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
+        deadline = time.monotonic() + 10
+        ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
+        if not ok:
+            return [], [f'OpenClaw gateway: Handshake für sessions.delete fehlgeschlagen (session={session_key})']
+        ok, resp = _openclaw_ws_call(ws, 'sessions.delete', {'key': session_key}, deadline)
+        if not ok:
+            return [], [f'OpenClaw gateway: sessions.delete fehlgeschlagen (session={session_key}): {resp}']
+        return [f'openclaw gateway session {session_key}'], []
+    except Exception as e:
+        return [], [f'OpenClaw gateway: sessions.delete Exception (session={session_key}): {e}']
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def delete_history_session(cfg, session_id):
     """Löscht die Datei(en) einer Gesprächs-Session lokal auf dem Agent-Rechner.
     Wird via MQTT action=delete-history-session ausgelöst (Swipe-to-Delete im
@@ -3449,11 +3476,16 @@ def delete_history_session(cfg, session_id):
     zu Logging-Zwecken an den Server."""
     errors = []
     deleted = []
+    openclaw_gateway_cfg = _openclaw_ws_ready(cfg) if _is_openclaw_binary(_cli_binary(cfg)) else None
     if not session_id:
         errors.append('keine session_id übergeben')
     elif _is_hermes_cfg(cfg):
         # Hermes: keine Dateien — Löschen über `hermes sessions delete --yes <id>`.
         deleted, errors = _hermes_delete_session(cfg, session_id)
+    elif openclaw_gateway_cfg is not None:
+        # Echte Gateway-Session (agent:main:dashboard:<uuid>) — keine lokale
+        # Datei, Löschen über sessions.delete (native RPC) statt Dateisystem.
+        deleted, errors = _openclaw_gateway_delete_session(openclaw_gateway_cfg, session_id)
     else:
         try:
             paths = build_history_delete_paths(cfg, session_id)
