@@ -2985,6 +2985,11 @@ def _openclaw_gateway_history_list(server_cfg):
             key = s.get('key')
             if not key:
                 continue
+            if s.get('archived'):
+                # Über "löschen" (sessions.patch archived:true, siehe
+                # _openclaw_gateway_delete_session) ausgeblendete Sessions
+                # nicht wieder in der Liste zeigen.
+                continue
             preview = ''
             ok2, hist_payload = _openclaw_ws_call(ws, 'chat.history', {'sessionKey': key, 'limit': 10}, deadline)
             if ok2:
@@ -3442,24 +3447,38 @@ def build_history_delete_paths(cfg, session_id):
 
 
 def _openclaw_gateway_delete_session(server_cfg, session_key):
-    """Löscht eine Session permanent über sessions.delete (native Gateway-
-    RPC, docs.openclaw.ai/gateway/protocol — Gegenstück zu sessions.archive
-    für ein reines Soft-Hide, hier bewusst die permanente Variante, da die
-    App den Eintrag ohnehin schon als "gelöscht" behandelt). Rückgabe
-    (deleted, errors), gleiche Form wie _hermes_delete_session()."""
+    """Blendet eine Session aus (sessions.patch mit archived:true) statt sie
+    permanent zu löschen — sessions.delete verlangt operator.admin, deutlich
+    breiter als unser bewusst minimaler read+write-Scope (Nutzerentscheidung
+    2026-09-04, sessions.archive statt operator.admin anzufragen). Session
+    bleibt serverseitig erhalten, verschwindet aber aus der Liste (siehe
+    Archiv-Filter in _openclaw_gateway_history_list). Rückgabe (deleted,
+    errors), gleiche Form wie _hermes_delete_session().
+
+    archived:true braucht laut Doku den aktuellen sessionId als
+    expectedSessionId (Race-Schutz) — vorher per sessions.describe geholt;
+    schlägt das fehl, wird trotzdem ohne expectedSessionId versucht (evtl.
+    optional, Format-Diagnose falls nicht)."""
     ws = None
     try:
         ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
         deadline = time.monotonic() + 10
         ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
         if not ok:
-            return [], [f'OpenClaw gateway: Handshake für sessions.delete fehlgeschlagen (session={session_key})']
-        ok, resp = _openclaw_ws_call(ws, 'sessions.delete', {'key': session_key}, deadline)
+            return [], [f'OpenClaw gateway: Handshake für sessions.patch fehlgeschlagen (session={session_key})']
+        ok, describe = _openclaw_ws_call(ws, 'sessions.describe', {'key': session_key}, deadline)
+        expected_session_id = (describe or {}).get('sessionId') if ok else None
         if not ok:
-            return [], [f'OpenClaw gateway: sessions.delete fehlgeschlagen (session={session_key}): {resp}']
-        return [f'openclaw gateway session {session_key}'], []
+            log.info(f'OpenClaw gateway: sessions.describe fehlgeschlagen (Format-Diagnose), versuche Archivieren ohne expectedSessionId: {describe}')
+        params = {'key': session_key, 'archived': True}
+        if expected_session_id:
+            params['expectedSessionId'] = expected_session_id
+        ok, resp = _openclaw_ws_call(ws, 'sessions.patch', params, deadline)
+        if not ok:
+            return [], [f'OpenClaw gateway: sessions.patch (archive) fehlgeschlagen (session={session_key}): {resp}']
+        return [f'openclaw gateway session {session_key} archiviert'], []
     except Exception as e:
-        return [], [f'OpenClaw gateway: sessions.delete Exception (session={session_key}): {e}']
+        return [], [f'OpenClaw gateway: sessions.patch Exception (session={session_key}): {e}']
     finally:
         if ws is not None:
             try:
