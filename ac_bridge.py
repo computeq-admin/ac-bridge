@@ -2952,6 +2952,87 @@ def _read_openclaw_detail(path):
     return messages
 
 
+# --- OpenClaw über den nativen Gateway-Kanal (bevorzugt gegenüber den
+# .trajectory.jsonl-Dateien oben) ---
+#
+# Echte Gateway-Sessions (siehe call_agent_openclaw_gateway) landen serverseitig
+# in einer SQLite-Datenbank (~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite,
+# laut health-Event live bestätigt 2026-09-04), NICHT in .trajectory.jsonl-Dateien
+# — die oben stehenden _read_openclaw_*-Funktionen sehen sie deshalb gar nicht.
+# Statt das SQLite-Format selbst zu parsen (undokumentiert, Implementierungsdetail)
+# wird derselbe Gateway-Kanal genutzt wie fürs Senden — sessions.list/chat.history,
+# analog zu sessions.create/chat.send in call_agent_openclaw_gateway().
+
+def _openclaw_gateway_history_list(server_cfg):
+    ws = None
+    try:
+        ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
+        deadline = time.monotonic() + 10
+        ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
+        if not ok:
+            return []
+        ok, payload = _openclaw_ws_call(ws, 'sessions.list', {'limit': 50}, deadline)
+        if not ok:
+            return []
+        entries = []
+        for s in (payload or {}).get('sessions') or []:
+            key = s.get('key')
+            if not key:
+                continue
+            entries.append({
+                'session_id':    key,
+                'title':         (s.get('displayName') or s.get('label') or 'Gespräch')[:60],
+                'updated_at':    s.get('updatedAt') or s.get('createdAt') or '',
+                # Feldname nicht abschließend verifiziert (Format-Diagnose,
+                # siehe Log falls dauerhaft 0/None) — App zeigt notfalls nur
+                # keine Nachrichtenanzahl an, kein Blocker.
+                'message_count': s.get('messageCount') or 0,
+            })
+        return entries
+    except Exception as e:
+        log.warning(f'OpenClaw gateway: sessions.list fehlgeschlagen: {e}')
+        return []
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+def _openclaw_gateway_history_detail(server_cfg, session_key):
+    ws = None
+    try:
+        ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=5)
+        deadline = time.monotonic() + 10
+        ok, _hello = _openclaw_ws_handshake(ws, server_cfg, deadline)
+        if not ok:
+            return None
+        ok, payload = _openclaw_ws_call(ws, 'chat.history', {'sessionKey': session_key, 'limit': 200}, deadline)
+        if not ok:
+            return None
+        messages = []
+        for m in (payload or {}).get('messages') or []:
+            role = m.get('role')
+            text = _openclaw_extract_text(m.get('message')) or m.get('deltaText') or ''
+            if role and text:
+                messages.append({
+                    'role': 'agent' if role == 'assistant' else role,
+                    'content': text,
+                    'timestamp': m.get('timestamp', ''),
+                })
+        return messages or None
+    except Exception as e:
+        log.warning(f'OpenClaw gateway: chat.history fehlgeschlagen: {e}')
+        return None
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 # --- Hermes (Sessions liegen in SQLite, Zugriff über die hermes-CLI statt Dateien) ---
 
 def _is_hermes_cfg(cfg):
@@ -3273,6 +3354,10 @@ def _history_session_files(cfg):
 def build_history_list(cfg):
     if _is_hermes_cfg(cfg):
         return _hermes_history_list(cfg)
+    if _is_openclaw_binary(_cli_binary(cfg)):
+        server_cfg = _openclaw_ws_ready(cfg)
+        if server_cfg is not None:
+            return _openclaw_gateway_history_list(server_cfg)
     files, backend = _history_session_files(cfg)
     if backend is None:
         return []
@@ -3288,6 +3373,15 @@ def build_history_list(cfg):
 def build_history_detail(cfg, session_id):
     if _is_hermes_cfg(cfg):
         return _hermes_history_detail(cfg, session_id)
+    if _is_openclaw_binary(_cli_binary(cfg)):
+        server_cfg = _openclaw_ws_ready(cfg)
+        if server_cfg is not None:
+            detail = _openclaw_gateway_history_detail(server_cfg, session_id)
+            if detail is not None:
+                return detail
+            # Kein Ergebnis über den Gateway (z.B. eine ältere, rein lokale
+            # CLI-Session) — unten trotzdem den JSONL-Pfad versuchen, statt
+            # einer leeren Antwort.
     files, backend = _history_session_files(cfg)
     if backend is None:
         return None
