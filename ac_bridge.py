@@ -2204,6 +2204,11 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
             if frame is None:
                 log.warning(f'OpenClaw gateway: Timeout/Verbindungsende während der Antwort (Session {session_key}).')
                 return None, None
+            # Jeden Frame vor der type/event-Weiche loggen (Format-Diagnose) —
+            # falls kein session.message/state=="done" je ankommt, zeigt das
+            # HIER, was stattdessen tatsächlich reinkommt (anderer Event-Name,
+            # anderes Feld, res statt event, o.ä.), statt eines stillen Hängers.
+            log.info(f'OpenClaw gateway: Frame empfangen (Format-Diagnose): {frame}')
             if frame.get('type') != 'event':
                 continue
             event   = frame.get('event')
