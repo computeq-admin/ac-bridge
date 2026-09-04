@@ -818,7 +818,7 @@ def _openclaw_ws_ready(cfg):
             # genannte Wert, live bestätigt am 2026-09-04.
             'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
             'role': 'operator',
-            'scopes': ['operator.read', 'operator.write'],
+            'scopes': ['operator.read', 'operator.write', 'operator.admin'],  # TEMP Phase-0-Diagnose
             'auth': {'token': server_cfg['token']},
         }, time.monotonic() + 3)
         if not ok or (hello_payload or {}).get('type') != 'hello-ok':
@@ -2036,7 +2036,7 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
             # genannte Wert, live bestätigt am 2026-09-04.
             'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
             'role': 'operator',
-            'scopes': ['operator.read', 'operator.write'],
+            'scopes': ['operator.read', 'operator.write', 'operator.admin'],  # TEMP Phase-0-Diagnose
             'auth': {'token': server_cfg['token']},
         }, deadline)
         if not ok or (hello_payload or {}).get('type') != 'hello-ok':
