@@ -4,3 +4,4 @@ venv/
 ac_bridge.log
 __pycache__/
 *.pyc
+openclaw_device_key.pem

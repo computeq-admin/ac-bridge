@@ -798,29 +798,143 @@ def _openclaw_gateway_config():
     return {'host': '127.0.0.1', 'port': gateway.get('port') or 18789, 'token': token}
 
 
+_OPENCLAW_CLIENT_ID   = 'gateway-client'   # serverseitiges Enum, siehe Kommentar unten
+_OPENCLAW_CLIENT_MODE = 'backend'
+_OPENCLAW_ROLE        = 'operator'
+_OPENCLAW_SCOPES      = ['operator.read', 'operator.write']
+
+_openclaw_device_key_path = REPO_DIR / 'openclaw_device_key.pem'
+
+
+def _openclaw_device_identity():
+    """Lädt das dauerhafte Ed25519-Schlüsselpaar der Bridge für den Gateway-
+    Handshake, erzeugt es beim allerersten Aufruf. NICHT bei jedem Reconnect
+    neu erzeugen — aus Gateway-Sicht wäre das sonst jedes Mal ein neues,
+    unbekanntes Gerät (verliert die automatische Loopback-Genehmigung, siehe
+    _openclaw_ws_handshake). Rückgabe: (private_key, device_id, public_key_b64url)."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+    import hashlib
+    import base64 as _base64
+
+    if _openclaw_device_key_path.is_file():
+        raw = _openclaw_device_key_path.read_bytes()
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+    else:
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        raw = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        _openclaw_device_key_path.write_bytes(raw)
+        try:
+            os.chmod(_openclaw_device_key_path, 0o600)
+        except Exception:
+            pass
+        log.info(f'OpenClaw gateway: neue Geräte-Identität erzeugt ({_openclaw_device_key_path})')
+
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
+    )
+    device_id     = hashlib.sha256(public_bytes).hexdigest()
+    public_b64url = _base64.urlsafe_b64encode(public_bytes).rstrip(b'=').decode('ascii')
+    return private_key, device_id, public_b64url
+
+
+def _openclaw_sign_device_payload(private_key, device_id, signed_at_ms, token, nonce):
+    """Signatur-Payload laut Community-Referenzimplementierung — NICHT zu 100%
+    amtlich verifiziert (siehe Plan-Vorbehalt). Bei Ablehnung durch den Server
+    zeigt dessen Fehlermeldung genau, was abweicht (gleiches Vorgehen wie bei
+    den vorherigen client.id-/Scope-Live-Fixes)."""
+    import base64 as _base64
+    payload = (
+        f"v2|{device_id}|{_OPENCLAW_CLIENT_ID}|{_OPENCLAW_CLIENT_MODE}|{_OPENCLAW_ROLE}|"
+        f"{','.join(_OPENCLAW_SCOPES)}|{signed_at_ms}|{token}|{nonce}"
+    )
+    signature = private_key.sign(payload.encode('utf-8'))
+    return _base64.urlsafe_b64encode(signature).rstrip(b'=').decode('ascii')
+
+
+def _openclaw_ws_handshake(ws, server_cfg, deadline):
+    """Gemeinsamer connect-Handshake für _openclaw_ws_ready() (Live-Probe) und
+    call_agent_openclaw_gateway() (echter Aufruf). Wartet zuerst auf das vom
+    Server gesendete connect.challenge-Event (Nonce), signiert dann eine
+    Ed25519-Geräte-Identität damit und schickt sie im connect-Request mit —
+    reine Token-Auth bekommt auf der nativen WS-Route laut Doku UND Live-Test
+    (2026-09-04, auch mit angefragtem operator.admin) grundsätzlich keinen
+    operator.write-Scope, nur eine echte signierte Geräte-Identität schaltet
+    das frei. Gibt (ok, hello_payload) zurück, wie _openclaw_ws_call()."""
+    challenge = None
+    while True:
+        frame = _openclaw_ws_recv_json(ws, deadline)
+        if frame is None:
+            log.info('OpenClaw gateway (WS): kein connect.challenge erhalten (Format-Diagnose) — versuche ohne Geräte-Signatur.')
+            break
+        if frame.get('type') == 'event' and frame.get('event') == 'connect.challenge':
+            challenge = frame.get('payload') or {}
+            break
+        # Andere Frames vor der Challenge sind laut Doku nicht zu erwarten,
+        # aber überspringen statt abzubrechen (Format-Diagnose).
+        log.info(f'OpenClaw gateway (WS): unerwarteter Frame vor connect.challenge (Format-Diagnose): {frame}')
+
+    connect_params = {
+        'minProtocol': 4, 'maxProtocol': 4,
+        # 'id' ist laut Live-Test KEIN Freitext, sondern ein serverseitig
+        # geprüfter Enum-Wert ('ac-bridge' → 400 INVALID_REQUEST) —
+        # "gateway-client" ist der in der Doku für client.mode:"backend"
+        # genannte Wert, live bestätigt am 2026-09-04.
+        'client': {'id': _OPENCLAW_CLIENT_ID, 'version': '1.0', 'platform': sys.platform, 'mode': _OPENCLAW_CLIENT_MODE},
+        'role': _OPENCLAW_ROLE,
+        'scopes': _OPENCLAW_SCOPES,
+        'auth': {'token': server_cfg['token']},
+    }
+
+    if challenge is not None:
+        nonce = challenge.get('nonce')
+        signed_at_ms = int(time.time() * 1000)
+        try:
+            private_key, device_id, public_b64url = _openclaw_device_identity()
+            signature = _openclaw_sign_device_payload(private_key, device_id, signed_at_ms, server_cfg['token'], nonce)
+            connect_params['device'] = {
+                'id': device_id, 'publicKey': public_b64url,
+                'signature': signature, 'signedAt': signed_at_ms, 'nonce': nonce,
+            }
+        except Exception as e:
+            log.warning(f'OpenClaw gateway (WS): Geräte-Signatur fehlgeschlagen, versuche ohne: {e}')
+
+    try:
+        return _openclaw_ws_call(ws, 'connect', connect_params, deadline)
+    except Exception as e:
+        # Server schließt bei "pairing required" laut Doku die Verbindung
+        # (Code 1008) statt eine reguläre res-Fehlerantwort zu senden —
+        # close_status_code/close_reason mitloggen, falls vorhanden, das
+        # verrät ob die automatische Loopback-Genehmigung nicht griff.
+        status  = getattr(ws, 'close_status_code', None) or getattr(ws, 'status_code', None)
+        reason  = getattr(ws, 'close_reason', None)
+        if status == 1008 or (reason and 'pairing' in str(reason).lower()):
+            log.warning(
+                f'OpenClaw gateway (WS): Verbindung mit Code {status} geschlossen, vermutlich Pairing nötig '
+                f'(reason={reason}) — auf dem Gateway-Host prüfen: openclaw devices list / openclaw devices approve, '
+                f'oder gateway.nodes.pairing.autoApproveLocal.'
+            )
+        else:
+            log.warning(f'OpenClaw gateway (WS): connect fehlgeschlagen (status={status}, reason={reason}): {e}')
+        return False, None
+
+
 def _openclaw_ws_ready(cfg):
     """Live-Probe fürs native Gateway-Protokoll: kurzer connect+hello-ok-
-    Versuch (dieselbe Handshake-Logik wie call_agent_openclaw_gateway, per
-    _openclaw_ws_call unten wiederverwendet), sofort wieder geschlossen. Gibt
-    server_cfg zurück wenn nutzbar, sonst None (Aufrufer fällt dann auf den
-    CLI-Pfad zurück)."""
+    Versuch (_openclaw_ws_handshake, dieselbe Logik wie call_agent_openclaw_gateway),
+    sofort wieder geschlossen. Gibt server_cfg zurück wenn nutzbar, sonst None
+    (Aufrufer fällt dann auf den CLI-Pfad zurück)."""
     server_cfg = _openclaw_gateway_config()
     if server_cfg is None:
         return None
     ws = None
     try:
         ws = websocket.create_connection(f"ws://{server_cfg['host']}:{server_cfg['port']}", timeout=3)
-        ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
-            'minProtocol': 4, 'maxProtocol': 4,
-            # 'id' ist laut Live-Test KEIN Freitext, sondern ein serverseitig
-            # geprüfter Enum-Wert ('ac-bridge' → 400 INVALID_REQUEST) —
-            # "gateway-client" ist der in der Doku für client.mode:"backend"
-            # genannte Wert, live bestätigt am 2026-09-04.
-            'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
-            'role': 'operator',
-            'scopes': ['operator.read', 'operator.write', 'operator.admin'],  # TEMP Phase-0-Diagnose
-            'auth': {'token': server_cfg['token']},
-        }, time.monotonic() + 3)
+        ok, hello_payload = _openclaw_ws_handshake(ws, server_cfg, time.monotonic() + 5)
         if not ok or (hello_payload or {}).get('type') != 'hello-ok':
             log.info('OpenClaw gateway (WS) connect/hello-ok fehlgeschlagen — falling back to CLI.')
             return None
@@ -2025,20 +2139,10 @@ def call_agent_openclaw_gateway(cfg, server_cfg, prompt, system_prompt='', files
     try:
         ws = websocket.create_connection(ws_url, timeout=10)
 
-        # 1) Handshake — client.mode "backend" auf Loopback darf laut Doku das
-        # device-Feld (Public-Key-Pairing) weglassen, wenn der gemeinsame
-        # Gateway-Token genutzt wird (genau unser Fall).
-        ok, hello_payload = _openclaw_ws_call(ws, 'connect', {
-            'minProtocol': 4, 'maxProtocol': 4,
-            # 'id' ist laut Live-Test KEIN Freitext, sondern ein serverseitig
-            # geprüfter Enum-Wert ('ac-bridge' → 400 INVALID_REQUEST) —
-            # "gateway-client" ist der in der Doku für client.mode:"backend"
-            # genannte Wert, live bestätigt am 2026-09-04.
-            'client': {'id': 'gateway-client', 'version': '1.0', 'platform': sys.platform, 'mode': 'backend'},
-            'role': 'operator',
-            'scopes': ['operator.read', 'operator.write', 'operator.admin'],  # TEMP Phase-0-Diagnose
-            'auth': {'token': server_cfg['token']},
-        }, deadline)
+        # 1) Handshake — signierte Ed25519-Geräte-Identität, siehe
+        # _openclaw_ws_handshake() (reine Token-Auth bekommt auf der WS-Route
+        # keinen operator.write-Scope, live bestätigt 2026-09-04).
+        ok, hello_payload = _openclaw_ws_handshake(ws, server_cfg, deadline)
         if not ok or (hello_payload or {}).get('type') != 'hello-ok':
             log.warning(f'OpenClaw gateway: connect/hello-ok fehlgeschlagen (Format-Diagnose): {hello_payload}')
             return None, None
