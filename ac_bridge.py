@@ -683,7 +683,23 @@ def _hermes_api_server_own_process(cfg):
             ts = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
             age_s = (datetime.now(timezone.utc) - ts).total_seconds()
             if age_s > _HERMES_RUNTIME_STATUS_STALE_TTL_S:
-                log.info(f'Hermes gateway_state.json is stale ({age_s:.0f}s) — treating api_server as not owned.')
+                # Diagnose-Zusatz: unterscheidet "Prozess abgestürzt" (pid tot)
+                # von "Prozess hängt, schreibt aber keinen Heartbeat mehr"
+                # (pid lebt) — ohne das steht im Log nur "stale", man müsste
+                # im exakten Fehlermoment auf dem Server nachsehen, welcher der
+                # beiden Fälle vorliegt.
+                stale_pid = status.get('pid')
+                pid_alive = None
+                if isinstance(stale_pid, int):
+                    try:
+                        os.kill(stale_pid, 0)
+                        pid_alive = True
+                    except OSError:
+                        pid_alive = False
+                log.info(
+                    f'Hermes gateway_state.json is stale ({age_s:.0f}s) — treating api_server as not owned '
+                    f'(pid={stale_pid}, process_alive={pid_alive}).'
+                )
                 return False
         except Exception:
             pass  # kaputtes/unbekanntes Format ignorieren, nicht deswegen scheitern
