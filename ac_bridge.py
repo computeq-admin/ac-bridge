@@ -647,8 +647,11 @@ def _hermes_runtime_status(profile):
 def _hermes_api_server_own_process(cfg):
     """True, wenn gateway_state.json bestätigt, dass DIESES Profil (nicht ein
     anderer Hermes-Account auf demselben Server) seinen eigenen api_server-
-    Adapter erfolgreich gebunden hat und der Gateway-Prozess noch lebt und
-    kürzlich seinen Status geschrieben hat.
+    Adapter erfolgreich gebunden hat und der zugehörige Gateway-Prozess laut
+    einem ECHTEN, gerade eben durchgeführten Live-Check (os.kill(pid, 0))
+    noch lebt. Wie lange der zuletzt geschriebene Status her ist, entscheidet
+    NICHT mehr mit (siehe Staleness-Kommentar weiter unten) — nur ob die
+    zuletzt gemeldete PID gerade jetzt noch existiert.
 
     Hintergrund (Recherche gegen den offiziellen Quellcode, github.com/
     NousResearch/hermes-agent): Bindet der API-Server beim Start einen bereits
@@ -673,11 +676,34 @@ def _hermes_api_server_own_process(cfg):
     status = _hermes_runtime_status(cfg.get('hermes_profile', ''))
     if status is None:
         return False
-    platform_state = ((status.get('platforms') or {}).get('api_server') or {}).get('state')
+    api_server_platform = (status.get('platforms') or {}).get('api_server') or {}
+    platform_state = api_server_platform.get('state')
     if platform_state != 'connected':
         return False
 
-    updated_at = status.get('updated_at')
+    # WICHTIG: platforms.api_server.updated_at (adapter-eigener Zeitstempel),
+    # NICHT status['updated_at'] (Top-Level-Zeitstempel der GESAMTEN Datei).
+    # Live-Fund 2026-09-08: der Top-Level-Zeitstempel wird von JEDEM Adapter
+    # aktualisiert (z.B. Telegram) — der api_server-Adapter kann also längst
+    # eingefroren sein, während Telegram den Top-Level-Zeitstempel fleißig
+    # frisch hält, sodass diese Prüfung fälschlich "aktuell" ergäbe. Konkret
+    # beobachtet: api_server.updated_at war über 24h alt, während der
+    # Gateway-Prozess (und Telegram) durchgehend liefen.
+    # Staleness ist NUR noch ein Diagnose-Signal (geloggt), KEIN hartes
+    # Abbruchkriterium mehr — siehe Vorfall 2026-09-08: sobald api_server
+    # einmal als "stale" eingestuft wird, ruft die Bridge ihn nie wieder auf
+    # (fällt dauerhaft auf CLI zurück). Wird updated_at aber nur bei echter
+    # Nutzung aktualisiert (nicht durch einen unabhängigen Timer), kann sich
+    # der Status dann NIE mehr von selbst erholen — ein Teufelskreis: keine
+    # Anfrage → kein Update → weiterhin "stale" → keine Anfrage. Statt hier
+    # hart abzubrechen, läuft die Funktion bei jedem Job weiter bis zum
+    # echten PID-Live-Check unten und dem anschließenden /health-Request in
+    # _hermes_api_server_ready() — das sind beides ECHTE, aktuelle Prüfungen,
+    # nicht von der (evtl. nie mehr aktualisierten) Datei abhängig. Der
+    # Eigentums-Check (PID + platform_state=='connected' oben) bleibt
+    # bestehen, nur die reine Zeit-Schwelle wird nicht mehr als K.-o.-Kriterium
+    # genutzt.
+    updated_at = api_server_platform.get('updated_at')
     if isinstance(updated_at, str):
         try:
             ts = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
@@ -697,10 +723,9 @@ def _hermes_api_server_own_process(cfg):
                     except OSError:
                         pid_alive = False
                 log.info(
-                    f'Hermes gateway_state.json is stale ({age_s:.0f}s) — treating api_server as not owned '
+                    f'Hermes gateway_state.json is stale ({age_s:.0f}s) — trying live /health check anyway '
                     f'(pid={stale_pid}, process_alive={pid_alive}).'
                 )
-                return False
         except Exception:
             pass  # kaputtes/unbekanntes Format ignorieren, nicht deswegen scheitern
 
