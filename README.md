@@ -11,7 +11,7 @@ The bridge runs as a systemd user service, listens for MQTT wakeup signals, call
 - Python 3.8+
 - `python3-venv` (`sudo apt install python3-venv`)
 - A local AI agent with a CLI interface (e.g. Claude CLI, OpenClaw, Aider, Goose …)
-- For full setup: an account at https://agent-connect.computeq.de
+- For full setup: an account at https://agent-talk.computeq.de
 - For iOS App setup: the **Agent Talk** app on your iPhone
 - For Telegram-only: a Telegram bot token (from [@BotFather](https://t.me/BotFather)) and your Telegram user ID
 
@@ -50,7 +50,7 @@ Output: `Token-A: <64-char hex token>` plus a QR code rendered in the terminal.
 
 The user can either:
 - **Scan the QR code** with the **Agent Talk iOS app** (Config tab → "Scan Token-A") — the app then displays a 6-digit OTT automatically, or
-- Open https://agent-connect.computeq.de, go to "Set up connection", enter the Token-A manually, and receive the OTT there.
+- Open https://agent-talk.computeq.de, sign in, go to Settings → "Bridge connection", enter the Token-A manually, and receive the OTT there.
 
 **Step 2 — Redeem the 6-digit OTT:**
 ```bash
@@ -66,7 +66,7 @@ Optional flag: `--no-service` skips service installation.
 **Step 3 — Configure the CLI agent:**
 
 Use the **Agent Talk iOS app** (Config tab → Agent Configuration) or open
-https://agent-connect.computeq.de and go to "Configure Bridge".
+https://agent-talk.computeq.de and go to Settings → "Backend".
 Use the preset buttons (e.g. "Claude Defaults") to fill in the parameters.
 The bridge receives the updated config via MQTT automatically.
 
