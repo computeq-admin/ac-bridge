@@ -58,9 +58,9 @@ HERMES_TITLE_CACHE_FILE = Path(__file__).parent / 'hermes_title_cache.json'
 # Lokale, vom Server komplett unangetastete Ergänzung zu cli_env (config.json) —
 # cli_env wird bei jedem Server-Config-Push mitgeschickt (auch als leeres {}) und
 # ist NICHT in PROTECTED_CONFIG_KEYS, wird also von apply_config_update()
-# überschrieben. ac-bridge.env übersteht das (und Self-Updates, siehe
+# überschrieben. ac_bridge.env übersteht das (und Self-Updates, siehe
 # perform_self_update() — kein `git clean` dort, untracked Dateien bleiben erhalten).
-ENV_FILE              = Path(__file__).resolve().parent / 'ac-bridge.env'
+ENV_FILE              = Path(__file__).resolve().parent / 'ac_bridge.env'
 TELEGRAM_CONFIG_KEYS = ('telegram_chat_id', 'telegram_bot_token', 'telegram_system_prompt')
 
 PROTECTED_CONFIG_KEYS = {

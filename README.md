@@ -201,7 +201,7 @@ Created automatically by setup. Credentials are protected (chmod 600).
 | `cli_session_id_output_field` | JSON field name for session ID in output (dot-notation supported) |
 | `cli_answer_output_field` | JSON field name for answer text in output (dot-notation supported) |
 | `cli_extra_params` | Additional CLI flags (space-separated string) |
-| `cli_env` | Environment variables as JSON object — note: overwritten by every server-side config push (not in `PROTECTED_CONFIG_KEYS`), so it's unreliable for values you want to keep permanently. For that, use `ac-bridge.env` instead (see below). |
+| `cli_env` | Environment variables as JSON object — note: overwritten by every server-side config push (not in `PROTECTED_CONFIG_KEYS`), so it's unreliable for values you want to keep permanently. For that, use `ac_bridge.env` instead (see below). |
 | `cli_file_param` | Flag to pass file attachments (leave empty for Claude CLI) |
 | `cli_timeout` | Timeout in seconds (default: 600) |
 | `telegram_bot_token` | Telegram bot token for direct chat |
@@ -210,14 +210,14 @@ Created automatically by setup. Credentials are protected (chmod 600).
 | `lang` | Language for error messages: `DE` or `EN` |
 | `user` | Username (used for service name in Telegram-only mode) |
 
-### `ac-bridge.env` — local, permanent environment variables
+### `ac_bridge.env` — local, permanent environment variables
 
 Optional file, next to `ac_bridge.py` in the installation directory. Simple `KEY=VALUE` lines (one per line, `#` comments and blank lines ignored). These are added on top of your normal environment and `cli_env` — never a replacement, so an empty or missing file changes nothing.
 
 Unlike `cli_env`, this file is never touched by the server, is `.gitignore`d, and survives both self-updates (`git reset --hard` never removes untracked files) and server-pushed config updates. Use it for anything you want to set once and keep — e.g. an API key the CLI agent needs that shouldn't be reset by a preset change.
 
 ```
-# ac-bridge.env
+# ac_bridge.env
 SOME_API_KEY=sk-...
 ANOTHER_VAR=value
 ```

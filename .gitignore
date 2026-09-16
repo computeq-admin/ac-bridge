@@ -1,6 +1,6 @@
 gitupdate.sh
 config.json
-ac-bridge.env
+ac_bridge.env
 venv/
 ac_bridge.log
 __pycache__/
