@@ -224,7 +224,7 @@ ANOTHER_VAR=value
 
 ### Optional: Langfuse tracing for the CLI agent
 
-Set these three variables in `ac_bridge.env` to get per-tool-call traces for the CLI agent in a self-hosted [Langfuse](https://langfuse.com) instance:
+Set these three variables in `ac_bridge.env` to get full traces for the CLI agent in a self-hosted [Langfuse](https://langfuse.com) instance:
 
 ```
 LANGFUSE_BASE_URL=http://your-langfuse-host:3000
@@ -232,7 +232,15 @@ LANGFUSE_PUBLIC_KEY=pk-...
 LANGFUSE_SECRET_KEY=sk-...
 ```
 
-When all three are present, the bridge automatically registers `langfuse_hook.py` (PreToolUse/PostToolUse/PostToolUseFailure Claude Code hooks, added to `.claude/settings.local.json` in `cli_working_dir` — existing hook entries there are left untouched) and every tool call shows up as a span in Langfuse, grouped by Claude session ID. Remove the three variables (or leave them unset) to fall back to exactly the previous behavior — no hooks fire, no network calls, nothing changes.
+When all three are present, the bridge automatically registers `langfuse_hook.py` as a set of Claude Code hooks (added to `.claude/settings.local.json` in `cli_working_dir` — existing hook entries there are left untouched) that report the full conversation structure, not just tool calls:
+
+- **One trace per Claude session**, containing one **turn span** per user prompt/answer exchange (`UserPromptSubmit`/`Stop`/`StopFailure` — input is the prompt, output is Claude's final answer; a failed turn is marked as an error span instead of being silently dropped).
+- **Sub-agent spans** (`SubagentStart`/`SubagentStop`, e.g. the `Explore`/`Plan` built-in agents) nested under the turn they ran in.
+- **Tool-call spans** (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`) nested under the sub-agent that made the call, or directly under the turn if it was the main agent.
+
+Each span is sent as a single, complete OTLP span (via `POST /api/public/otel/v1/traces`) once its corresponding "end" hook fires — no Langfuse SDK dependency, pure Python standard library. Remove the three variables (or leave them unset) to fall back to exactly the previous behavior — no hooks fire, no network calls, nothing changes.
+
+**Using `claude` outside the bridge** (e.g. a cron-triggered script that calls `claude` directly): the hook registration logic lives in the standalone `ensure_langfuse_hook.py` (same directory, no dependencies beyond the standard library) so any script can call it too — `source ac_bridge.env` for the three variables, then `python3 ensure_langfuse_hook.py <cli_working_dir>` right before invoking `claude`, both best-effort (safe to ignore failures).
 
 ## How it works
 
