@@ -95,62 +95,10 @@ def _load_env_file(path):
     return result
 
 
-def _ensure_langfuse_hook_registered(cli_working_dir):
-    """Trägt die Langfuse-Hook-Einträge additiv in <cli_working_dir>/.claude/settings.local.json
-    ein, falls sie dort noch fehlen — bestehende, fremde Hook-Einträge bleiben unangetastet.
-    Wird nur aufgerufen, wenn LANGFUSE_PUBLIC_KEY/SECRET_KEY in cli_env/ac_bridge.env gesetzt
-    sind (siehe Call-Sites) — ohne die Variablen bleibt diese Funktion ungenutzt, settings.local.json
-    unangetastet. settings.local.json statt settings.json: laut Claude-Code-Doku nicht geteilt/
-    gitignored, genau richtig für eine maschinenspezifische, auto-generierte Instrumentierung."""
-    if not cli_working_dir:
-        return
-    project_dir = Path(os.path.expanduser(cli_working_dir))
-    if not project_dir.is_dir():
-        return
-    settings_path = project_dir / '.claude' / 'settings.local.json'
-
-    try:
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        if settings_path.exists():
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                settings = json.load(f)
-        else:
-            settings = {}
-    except (OSError, json.JSONDecodeError) as e:
-        log.error(f'_ensure_langfuse_hook_registered: {settings_path} nicht lesbar: {e}')
-        return
-
-    # sys.executable statt eines fest kodierten venv-Pfads — ac_bridge.py läuft
-    # bereits im richtigen venv, langfuse_hook.py braucht denselben Interpreter
-    # nur wegen der Konsistenz, nicht wegen echter Abhängigkeiten (reine stdlib).
-    hook_python = sys.executable
-    hook_script = str(REPO_DIR / 'langfuse_hook.py')
-
-    changed = False
-    hooks = settings.setdefault('hooks', {})
-    for event_name in (
-        'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
-        'UserPromptSubmit', 'Stop', 'StopFailure', 'SubagentStart', 'SubagentStop',
-    ):
-        entries = hooks.setdefault(event_name, [])
-        already_registered = any(
-            h.get('type') == 'command' and h.get('command') == hook_python and h.get('args') == [hook_script]
-            for entry in entries
-            for h in entry.get('hooks', [])
-        )
-        if not already_registered:
-            entries.append({
-                'hooks': [{'type': 'command', 'command': hook_python, 'args': [hook_script], 'timeout': 10}],
-            })
-            changed = True
-
-    if changed:
-        try:
-            with open(settings_path, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, indent=2)
-            log.info(f'Langfuse-Hooks in {settings_path} registriert.')
-        except OSError as e:
-            log.error(f'_ensure_langfuse_hook_registered: {settings_path} nicht schreibbar: {e}')
+# Ausgelagert nach ensure_langfuse_hook.py (2026-09-16), damit dieselbe Logik
+# auch von unabhängigen Automatisierungsskripten (z.B. check_mail_agent.sh)
+# genutzt werden kann, die `claude` direkt aufrufen statt über eine ac-bridge.
+from ensure_langfuse_hook import ensure_registered as _ensure_langfuse_hook_registered
 
 # ─────────────────────────────────────────────
 # Self-Update (öffentliches Repo, HTTPS read-only)
