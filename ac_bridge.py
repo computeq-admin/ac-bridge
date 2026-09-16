@@ -55,6 +55,12 @@ log = logging.getLogger('ac_bridge')
 CONFIG_FILE           = Path(__file__).parent / 'config.json'
 TELEGRAM_CONFIG_FILE  = Path(__file__).parent / 'telegram-config.json'
 HERMES_TITLE_CACHE_FILE = Path(__file__).parent / 'hermes_title_cache.json'
+# Lokale, vom Server komplett unangetastete Ergänzung zu cli_env (config.json) —
+# cli_env wird bei jedem Server-Config-Push mitgeschickt (auch als leeres {}) und
+# ist NICHT in PROTECTED_CONFIG_KEYS, wird also von apply_config_update()
+# überschrieben. ac-bridge.env übersteht das (und Self-Updates, siehe
+# perform_self_update() — kein `git clean` dort, untracked Dateien bleiben erhalten).
+ENV_FILE              = Path(__file__).resolve().parent / 'ac-bridge.env'
 TELEGRAM_CONFIG_KEYS = ('telegram_chat_id', 'telegram_bot_token', 'telegram_system_prompt')
 
 PROTECTED_CONFIG_KEYS = {
@@ -66,6 +72,27 @@ PROTECTED_CONFIG_KEYS = {
 ALLOWED_CLI_EXECUTABLES = {
     'claude', 'openclaw', 'hermes', 'copilot', 'gemini', 'aider', 'interpreter', 'goose',
 }
+
+
+def _load_env_file(path):
+    """Liest KEY=VALUE-Zeilen aus einer .env-Datei, ignoriert '#'-Kommentare und
+    Leerzeilen. Gibt {} zurück, wenn die Datei fehlt oder nicht lesbar ist — rein
+    additiv gedacht, nie ein Ersatz für os.environ."""
+    result = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    result[key] = value
+    except OSError:
+        pass
+    return result
 
 # ─────────────────────────────────────────────
 # Self-Update (öffentliches Repo, HTTPS read-only)
@@ -1261,6 +1288,7 @@ def _apply_hermes_reasoning(cfg, level, resume_id):
         return resume_id
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
+    env.update(_load_env_file(ENV_FILE))
     env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
     cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     cmd = [binary, 'chat', '-Q', '--yolo', '--accept-hooks', '-q', f'/reasoning {level}']
@@ -1555,6 +1583,7 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
 
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
+    env.update(_load_env_file(ENV_FILE))
     if is_hermes:
         # Profil-Auswahl: HERMES_HOME zeigt auf das Home des gewählten Hermes-Profils.
         env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
@@ -3224,6 +3253,7 @@ def _hermes_run(cfg, args, timeout=60):
         return None
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
+    env.update(_load_env_file(ENV_FILE))
     env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
     cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     try:
