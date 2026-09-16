@@ -94,6 +94,61 @@ def _load_env_file(path):
         pass
     return result
 
+
+def _ensure_langfuse_hook_registered(cli_working_dir):
+    """Trägt die Langfuse-Hook-Einträge additiv in <cli_working_dir>/.claude/settings.local.json
+    ein, falls sie dort noch fehlen — bestehende, fremde Hook-Einträge bleiben unangetastet.
+    Wird nur aufgerufen, wenn LANGFUSE_PUBLIC_KEY/SECRET_KEY in cli_env/ac_bridge.env gesetzt
+    sind (siehe Call-Sites) — ohne die Variablen bleibt diese Funktion ungenutzt, settings.local.json
+    unangetastet. settings.local.json statt settings.json: laut Claude-Code-Doku nicht geteilt/
+    gitignored, genau richtig für eine maschinenspezifische, auto-generierte Instrumentierung."""
+    if not cli_working_dir:
+        return
+    project_dir = Path(os.path.expanduser(cli_working_dir))
+    if not project_dir.is_dir():
+        return
+    settings_path = project_dir / '.claude' / 'settings.local.json'
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        if settings_path.exists():
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+        else:
+            settings = {}
+    except (OSError, json.JSONDecodeError) as e:
+        log.error(f'_ensure_langfuse_hook_registered: {settings_path} nicht lesbar: {e}')
+        return
+
+    # sys.executable statt eines fest kodierten venv-Pfads — ac_bridge.py läuft
+    # bereits im richtigen venv, langfuse_hook.py braucht denselben Interpreter
+    # nur wegen der Konsistenz, nicht wegen echter Abhängigkeiten (reine stdlib).
+    hook_python = sys.executable
+    hook_script = str(REPO_DIR / 'langfuse_hook.py')
+
+    changed = False
+    hooks = settings.setdefault('hooks', {})
+    for event_name in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+        entries = hooks.setdefault(event_name, [])
+        already_registered = any(
+            h.get('type') == 'command' and h.get('command') == hook_python and h.get('args') == [hook_script]
+            for entry in entries
+            for h in entry.get('hooks', [])
+        )
+        if not already_registered:
+            entries.append({
+                'hooks': [{'type': 'command', 'command': hook_python, 'args': [hook_script], 'timeout': 10}],
+            })
+            changed = True
+
+    if changed:
+        try:
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+            log.info(f'Langfuse-Hooks in {settings_path} registriert.')
+        except OSError as e:
+            log.error(f'_ensure_langfuse_hook_registered: {settings_path} nicht schreibbar: {e}')
+
 # ─────────────────────────────────────────────
 # Self-Update (öffentliches Repo, HTTPS read-only)
 # ─────────────────────────────────────────────
@@ -1289,6 +1344,8 @@ def _apply_hermes_reasoning(cfg, level, resume_id):
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
     env.update(_load_env_file(ENV_FILE))
+    if env.get('LANGFUSE_PUBLIC_KEY') and env.get('LANGFUSE_SECRET_KEY'):
+        _ensure_langfuse_hook_registered(cfg.get('cli_working_dir'))
     env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
     cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     cmd = [binary, 'chat', '-Q', '--yolo', '--accept-hooks', '-q', f'/reasoning {level}']
@@ -1584,6 +1641,8 @@ def _build_agent_command(cfg, prompt, system_prompt='', files=None, session_id_o
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
     env.update(_load_env_file(ENV_FILE))
+    if env.get('LANGFUSE_PUBLIC_KEY') and env.get('LANGFUSE_SECRET_KEY'):
+        _ensure_langfuse_hook_registered(cfg.get('cli_working_dir'))
     if is_hermes:
         # Profil-Auswahl: HERMES_HOME zeigt auf das Home des gewählten Hermes-Profils.
         env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
@@ -3254,6 +3313,8 @@ def _hermes_run(cfg, args, timeout=60):
     env = os.environ.copy()
     env.update(cfg.get('cli_env', {}))
     env.update(_load_env_file(ENV_FILE))
+    if env.get('LANGFUSE_PUBLIC_KEY') and env.get('LANGFUSE_SECRET_KEY'):
+        _ensure_langfuse_hook_registered(cfg.get('cli_working_dir'))
     env['HERMES_HOME'] = _hermes_home_for(cfg.get('hermes_profile', ''))
     cwd = os.path.expanduser(cfg['cli_working_dir']) if cfg.get('cli_working_dir') else None
     try:

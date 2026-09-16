@@ -222,6 +222,18 @@ SOME_API_KEY=sk-...
 ANOTHER_VAR=value
 ```
 
+### Optional: Langfuse tracing for the CLI agent
+
+Set these three variables in `ac_bridge.env` to get per-tool-call traces for the CLI agent in a self-hosted [Langfuse](https://langfuse.com) instance:
+
+```
+LANGFUSE_BASE_URL=http://your-langfuse-host:3000
+LANGFUSE_PUBLIC_KEY=pk-...
+LANGFUSE_SECRET_KEY=sk-...
+```
+
+When all three are present, the bridge automatically registers `langfuse_hook.py` (PreToolUse/PostToolUse/PostToolUseFailure Claude Code hooks, added to `.claude/settings.local.json` in `cli_working_dir` — existing hook entries there are left untouched) and every tool call shows up as a span in Langfuse, grouped by Claude session ID. Remove the three variables (or leave them unset) to fall back to exactly the previous behavior — no hooks fire, no network calls, nothing changes.
+
 ## How it works
 
 ### Full mode (Agent Talk iOS app / Alexa / Siri / Telegram via Agent Connect)
