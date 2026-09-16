@@ -174,6 +174,16 @@ def main():
 
     # ── Turn (User-Prompt -> Antwort) — Trace-Root ─────────────────────────
     if event == 'UserPromptSubmit':
+        # TEMPORÄR (2026-09-16): user_prompt kommt laut erstem Live-Test leer
+        # an — rohes Payload in eine feste Datei schreiben (zuverlässiger als
+        # stderr, dessen Sichtbarkeit vom Hook-Handling abhängt), um das
+        # tatsächliche Feld zu finden. Danach wieder entfernen.
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(STATE_DIR / 'debug_userpromptsubmit.json', 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            _log(f'debug dump failed: {e}')
         _write_state(session_id, 'turn', payload.get('prompt_id', ''), {
             'start_ns': time.time_ns(),
             'user_prompt': payload.get('user_prompt'),
