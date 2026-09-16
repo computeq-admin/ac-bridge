@@ -128,7 +128,10 @@ def _ensure_langfuse_hook_registered(cli_working_dir):
 
     changed = False
     hooks = settings.setdefault('hooks', {})
-    for event_name in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+    for event_name in (
+        'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
+        'UserPromptSubmit', 'Stop', 'StopFailure', 'SubagentStart', 'SubagentStop',
+    ):
         entries = hooks.setdefault(event_name, [])
         already_registered = any(
             h.get('type') == 'command' and h.get('command') == hook_python and h.get('args') == [hook_script]

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Claude-Code-Hook, der Tool-Call-Spans per OTLP/HTTP-JSON an ein self-hosted
-Langfuse schickt.
+"""Claude-Code-Hook, der Turn-/Sub-Agenten-/Tool-Call-Spans per OTLP/HTTP-JSON
+an ein self-hosted Langfuse schickt.
 
 Registriert von ac_bridge.py (_ensure_langfuse_hook_registered) für PreToolUse/
-PostToolUse/PostToolUseFailure, sobald LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY
-gesetzt sind (siehe ac_bridge.env). Ohne diese Variablen ist dieses Skript ein
-sofortiges No-Op — unabhängig davon, wer/wie `claude` gestartet hat (ac-bridge
-oder andere Automatisierung), solange die Hooks dort ebenfalls registriert sind.
+PostToolUse/PostToolUseFailure/UserPromptSubmit/Stop/StopFailure/SubagentStart/
+SubagentStop, sobald LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY gesetzt sind (siehe
+ac_bridge.env). Ohne diese Variablen ist dieses Skript ein sofortiges No-Op —
+unabhängig davon, wer/wie `claude` gestartet hat (ac-bridge oder andere
+Automatisierung), solange die Hooks dort ebenfalls registriert sind.
 
 Genutzter Endpunkt: POST /api/public/otel/v1/traces (OTLP/HTTP, JSON-Encoding)
 — NICHT die klassische /api/public/ingestion-Batch-API. Grund: das self-hosted
@@ -17,11 +18,20 @@ Partition zu verarbeiten — interne Migrationslogik, nicht weiter aufgelöst).
 Der OTLP-Endpunkt ist der Pfad, der beim bereits funktionierenden LangGraph-
 Beispiel (langfuse.langchain.CallbackHandler) nachweislich funktioniert.
 
-PreToolUse und PostToolUse sind zwei getrennte, zustandslose Prozessaufrufe
-ohne gemeinsamen Speicher. Start (PreToolUse) wird daher kurz lokal zwischen-
-gespeichert und bei PostToolUse zu EINEM vollständigen OTLP-Span (Start+Ende+
-Input+Output) zusammengebaut und in einem einzigen Request gesendet — reine
-Python-Standardbibliothek, keine Langfuse-SDK-/OTel-SDK-Abhängigkeit nötig.
+Jedes Start/Ende-Paar (UserPromptSubmit/Stop|StopFailure für den Turn,
+SubagentStart/SubagentStop für Sub-Agenten, PreToolUse/PostToolUse|
+PostToolUseFailure für Tool-Calls) sind zwei getrennte, zustandslose
+Prozessaufrufe ohne gemeinsamen Speicher. Der Start-Event wird daher kurz
+lokal zwischengespeichert und beim Ende-Event zu EINEM vollständigen OTLP-Span
+(Start+Ende+Input+Output) zusammengebaut und in einem einzigen Request
+gesendet — reine Python-Standardbibliothek, keine Langfuse-SDK-/OTel-SDK-
+Abhängigkeit nötig.
+
+Hierarchie: Turn-Span ist Trace-Root (kein parentSpanId, Korrelations-ID
+`prompt_id`). Tool-Call- und Sub-Agenten-Spans hängen als Kinder darunter,
+Tool-Calls INNERHALB eines Sub-Agenten hängen unter dessen Span (Korrelations-
+ID `agent_id`, laut Claude-Code-Hook-Schema ein gemeinsames Feld auf allen
+Events, auch auf verschachtelten Tool-Calls).
 
 Input/Output werden über die von Langfuse dafür vorgesehenen Span-Attribute
 `langfuse.observation.input`/`langfuse.observation.output` (JSON-String)
@@ -53,14 +63,46 @@ def _log(msg):
     print(f'[langfuse_hook] {msg}', file=sys.stderr)
 
 
-def _state_path(session_id, tool_use_id):
-    return STATE_DIR / session_id / f'{tool_use_id}.json'
+def _state_path(session_id, kind, key):
+    # kind ('turn'/'subagent'/'tool') als Präfix, damit die drei ID-Namensräume
+    # (prompt_id/agent_id/tool_use_id) sich nie versehentlich überschneiden.
+    return STATE_DIR / session_id / f'{kind}-{key}.json'
+
+
+def _write_state(session_id, kind, key, state):
+    if not key:
+        return
+    path = _state_path(session_id, kind, key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+    except OSError as e:
+        _log(f'could not write state for {kind}-{key}: {e}')
+
+
+def _read_and_clear_state(session_id, kind, key):
+    if not key:
+        return {}
+    path = _state_path(session_id, kind, key)
+    state = {}
+    if path.exists():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            _log(f'could not read state for {kind}-{key}: {e}')
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return state
 
 
 def _otel_id(value, hex_len):
-    """Deterministisch aus einer beliebigen Claude-ID (session_id/tool_use_id,
-    kein garantiertes Hex-Format) eine gültige OTel-Trace-/Span-ID ableiten
-    (32 bzw. 16 Hex-Zeichen)."""
+    """Deterministisch aus einer beliebigen Claude-ID (session_id/tool_use_id/
+    prompt_id/agent_id, kein garantiertes Hex-Format) eine gültige OTel-Trace-/
+    Span-ID ableiten (32 bzw. 16 Hex-Zeichen)."""
     return hashlib.sha256(value.encode('utf-8')).hexdigest()[:hex_len]
 
 
@@ -68,7 +110,8 @@ def _json_attr(key, value):
     return {'key': key, 'value': {'stringValue': json.dumps(value, ensure_ascii=False)}}
 
 
-def _send_span(session_id, tool_use_id, name, start_ns, end_ns, span_input, span_output, is_error):
+def _send_span(session_id, span_id_source, name, start_ns, end_ns, span_input, span_output,
+                is_error, parent_span_id_source=None):
     attributes = [
         _json_attr('langfuse.observation.input', span_input),
         _json_attr('langfuse.observation.output', span_output),
@@ -76,7 +119,7 @@ def _send_span(session_id, tool_use_id, name, start_ns, end_ns, span_input, span
     ]
     span = {
         'traceId': _otel_id(session_id, 32),
-        'spanId': _otel_id(tool_use_id, 16),
+        'spanId': _otel_id(span_id_source, 16),
         'name': name,
         'kind': 1,  # SPAN_KIND_INTERNAL
         # Als String, nicht als JSON-Zahl: uint64-Nanosekunden-Zeitstempel
@@ -88,6 +131,9 @@ def _send_span(session_id, tool_use_id, name, start_ns, end_ns, span_input, span
         'attributes': attributes,
         'status': {'code': 2 if is_error else 1},  # STATUS_CODE_ERROR : STATUS_CODE_OK
     }
+    if parent_span_id_source:
+        span['parentSpanId'] = _otel_id(parent_span_id_source, 16)
+
     body = {
         'resourceSpans': [{
             'resource': {'attributes': [{'key': 'service.name', 'value': {'stringValue': 'ac-bridge'}}]},
@@ -108,7 +154,7 @@ def _send_span(session_id, tool_use_id, name, start_ns, end_ns, span_input, span
         with urllib.request.urlopen(req, timeout=5) as resp:
             resp.read()
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        _log(f'send failed for tool_use_id {tool_use_id}: {e}')
+        _log(f'send failed for span {span_id_source}: {e}')
 
 
 def main():
@@ -123,55 +169,102 @@ def main():
 
     event = payload.get('hook_event_name', '')
     session_id = payload.get('session_id', '')
+    if not session_id:
+        return
+
+    # ── Turn (User-Prompt -> Antwort) — Trace-Root ─────────────────────────
+    if event == 'UserPromptSubmit':
+        _write_state(session_id, 'turn', payload.get('prompt_id', ''), {
+            'start_ns': time.time_ns(),
+            'user_prompt': payload.get('user_prompt'),
+        })
+        return
+
+    if event in ('Stop', 'StopFailure'):
+        prompt_id = payload.get('prompt_id', '')
+        if not prompt_id:
+            return
+        state = _read_and_clear_state(session_id, 'turn', prompt_id)
+        end_ns = time.time_ns()
+        _send_span(
+            session_id=session_id,
+            span_id_source=prompt_id,
+            name='turn',
+            start_ns=state.get('start_ns', end_ns),
+            end_ns=end_ns,
+            span_input=state.get('user_prompt'),
+            span_output=payload.get('last_assistant_message'),
+            is_error=(event == 'StopFailure'),
+        )
+        return
+
+    # ── Sub-Agenten (Explore/Plan/etc.) — Kind des Turn-Spans ──────────────
+    if event == 'SubagentStart':
+        agent_id = payload.get('agent_id', '')
+        _write_state(session_id, 'subagent', agent_id, {
+            'start_ns': time.time_ns(),
+            'agent_type': payload.get('agent_type', ''),
+            'prompt_id': payload.get('prompt_id', ''),
+        })
+        return
+
+    if event == 'SubagentStop':
+        agent_id = payload.get('agent_id', '')
+        if not agent_id:
+            return
+        state = _read_and_clear_state(session_id, 'subagent', agent_id)
+        end_ns = time.time_ns()
+        agent_type = state.get('agent_type') or payload.get('agent_type', 'subagent')
+        _send_span(
+            session_id=session_id,
+            span_id_source=agent_id,
+            name=agent_type,
+            start_ns=state.get('start_ns', end_ns),
+            end_ns=end_ns,
+            span_input={'agent_type': agent_type},
+            span_output=None,
+            is_error=False,
+            parent_span_id_source=state.get('prompt_id') or payload.get('prompt_id'),
+        )
+        return
+
+    # ── Tool-Calls — Kind des Sub-Agenten-Spans (falls agent_id gesetzt) oder
+    #    direkt des Turn-Spans ─────────────────────────────────────────────
     tool_use_id = payload.get('tool_use_id', '')
-    if not session_id or not tool_use_id:
+    if not tool_use_id:
         return
 
     if event == 'PreToolUse':
-        state = {
+        _write_state(session_id, 'tool', tool_use_id, {
             'start_ns': time.time_ns(),
             'tool_name': payload.get('tool_name', ''),
             'tool_input': payload.get('tool_input'),
-        }
-        path = _state_path(session_id, tool_use_id)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(state, f)
-        except OSError as e:
-            _log(f'could not write state for {tool_use_id}: {e}')
+            'agent_id': payload.get('agent_id', ''),
+            'prompt_id': payload.get('prompt_id', ''),
+        })
         return
 
     if event in ('PostToolUse', 'PostToolUseFailure'):
-        path = _state_path(session_id, tool_use_id)
-        state = {}
-        if path.exists():
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
-                _log(f'could not read state for {tool_use_id}: {e}')
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
+        state = _read_and_clear_state(session_id, 'tool', tool_use_id)
         end_ns = time.time_ns()
-        start_ns = state.get('start_ns', end_ns)
         tool_name = state.get('tool_name') or payload.get('tool_name', 'unknown_tool')
-        tool_input = state.get('tool_input')
         is_error = event == 'PostToolUseFailure'
         output = {'error': payload.get('error')} if is_error else payload.get('tool_response')
+        parent_source = (
+            state.get('agent_id') or payload.get('agent_id')
+            or state.get('prompt_id') or payload.get('prompt_id')
+        )
 
         _send_span(
             session_id=session_id,
-            tool_use_id=tool_use_id,
+            span_id_source=tool_use_id,
             name=tool_name,
-            start_ns=start_ns,
+            start_ns=state.get('start_ns', end_ns),
             end_ns=end_ns,
-            span_input=tool_input,
+            span_input=state.get('tool_input'),
             span_output=output,
             is_error=is_error,
+            parent_span_id_source=parent_source,
         )
 
 
