@@ -147,7 +147,14 @@ def _send_span(session_id, span_id_source, name, start_ns, end_ns, span_input, s
     req = urllib.request.Request(
         f'{LANGFUSE_BASE_URL}/api/public/otel/v1/traces',
         data=json.dumps(body).encode('utf-8'),
-        headers={'Content-Type': 'application/json', 'Authorization': f'Basic {auth}'},
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Basic {auth}',
+            # Ohne diesen Header läuft die Ingestion über den "delayed"-Pfad statt
+            # Echtzeit (live in der Langfuse-UI als Action-Item "Update OTel
+            # Instrumentation" angezeigt, 2026-09-17) — siehe Migration-Guide.
+            'x-langfuse-ingestion-version': '4',
+        },
         method='POST',
     )
     try:
